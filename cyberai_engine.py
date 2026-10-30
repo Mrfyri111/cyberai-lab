@@ -164,8 +164,49 @@ def ip_kind(ip):
     if addr.is_loopback:
         return "Этот компьютер"
 
+    if addr.version == 4 and addr in VIRTUAL_NET:
+        return "Виртуальная сеть (VPN, прокси, WSL или Docker)"
+
+    if addr.version == 4 and addr in CGNAT_NET:
+        return "Сеть провайдера или VPN (CGNAT / Tailscale)"
+
     if addr.is_link_local or addr.is_private:
         return "Локальная сеть (роутер или другое устройство)"
+
+    return ""
+
+
+VIRTUAL_NET = ipaddress.ip_network("172.16.0.0/12")
+CGNAT_NET = ipaddress.ip_network("100.64.0.0/10")
+
+# Сервисы, которые часто подключаются по IP без DNS-запроса.
+KNOWN_NETWORKS = [
+    (ipaddress.ip_network(net), label) for net, label in (
+        ("149.154.160.0/20", "Telegram"),
+        ("91.108.4.0/22", "Telegram"),
+        ("91.108.8.0/22", "Telegram"),
+        ("91.108.12.0/22", "Telegram"),
+        ("91.108.16.0/22", "Telegram"),
+        ("91.108.56.0/22", "Telegram"),
+        ("95.161.64.0/20", "Telegram"),
+        ("2001:67c:4e8::/48", "Telegram"),
+        ("2001:b28:f23c::/48", "Telegram"),
+        ("2001:b28:f23d::/48", "Telegram"),
+        ("2001:b28:f23f::/48", "Telegram"),
+        ("162.159.128.0/19", "Discord / Cloudflare"),
+    )
+]
+
+
+def service_by_ip(ip):
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return ""
+
+    for network, label in KNOWN_NETWORKS:
+        if addr.version == network.version and addr in network:
+            return label
 
     return ""
 
@@ -1154,7 +1195,7 @@ class CyberAIEngine:
 
         for ip, item in top:
             domain = self.names.get(ip, "")
-            service = service_name(domain)
+            service = service_name(domain) or service_by_ip(ip)
             ports = sorted(
                 item["ports"], key=item["ports"].get, reverse=True
             )[:3]
