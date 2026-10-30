@@ -1,0 +1,14 @@
+# Создано CyberAI Lab автоматически.
+[theme]
+base = "dark"
+primaryColor = "#3b82f6"
+backgroundColor = "#0a1020"
+secondaryBackgroundColor = "#162239"
+textColor = "#e5eaf5"
+
+[client]
+toolbarMode = "minimal"
+showSidebarNavigation = false
+
+[browser]
+gatherUsageStats = false

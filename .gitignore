@@ -1,0 +1,12 @@
+# Секреты и личные данные — НИКОГДА не загружать
+data/
+.streamlit/secrets.toml
+*.pcap
+*.pcapng
+
+# Служебное
+__pycache__/
+*.pyc
+.venv/
+venv/
+.vscode/
