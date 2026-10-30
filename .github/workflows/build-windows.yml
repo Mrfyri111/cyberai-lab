@@ -10,6 +10,7 @@ on:
     paths:
       - "**.py"
       - "requirements.txt"
+      - "assets/**"
       - ".github/workflows/build-windows.yml"
   workflow_dispatch:
 
@@ -36,13 +37,14 @@ jobs:
       - name: Установка библиотек
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt pyinstaller
+          pip install -r requirements.txt pyinstaller pywebview
 
       - name: Сборка .exe
         shell: pwsh
         run: |
-          pyinstaller --noconfirm --onefile --console `
+          pyinstaller --noconfirm --onefile --windowed `
             --name CyberAI_Lab `
+            --icon assets/cyberai.ico `
             --uac-admin `
             --add-data "app.py;." `
             --add-data "cyberai_engine.py;." `
@@ -60,13 +62,16 @@ jobs:
             --copy-metadata openai `
             --hidden-import psutil `
             --hidden-import cryptography.fernet `
+            --collect-all webview `
             run_app.py
 
       - name: Самопроверка (библиотеки и поиск атак в демо)
         shell: pwsh
         run: |
-          .\dist\CyberAI_Lab.exe --check
-          if ($LASTEXITCODE -ne 0) { throw "Самопроверка не прошла" }
+          # Программа оконная: PowerShell сам не ждёт её завершения.
+          $p = Start-Process -FilePath .\dist\CyberAI_Lab.exe -ArgumentList "--check" -Wait -PassThru
+          Get-Content "$env:LOCALAPPDATA\CyberAI Lab\cyberai.log" -ErrorAction SilentlyContinue
+          if ($p.ExitCode -ne 0) { throw "Самопроверка не прошла (код $($p.ExitCode))" }
 
       - name: Проверка запуска интерфейса
         shell: pwsh
@@ -82,7 +87,10 @@ jobs:
             } catch { }
           }
           Get-Process -Name CyberAI_Lab -ErrorAction SilentlyContinue | Stop-Process -Force
-          if (-not $ok) { throw "Интерфейс не запустился за 3 минуты" }
+          if (-not $ok) {
+            Get-Content "$env:LOCALAPPDATA\CyberAI Lab\cyberai.log" -ErrorAction SilentlyContinue
+            throw "Интерфейс не запустился за 3 минуты"
+          }
           Write-Host "Интерфейс запустился"
 
       - uses: actions/upload-artifact@v4

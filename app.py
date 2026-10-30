@@ -973,6 +973,16 @@ def set_auth_mode(mode):
     ss.auth_mode = mode
 
 
+def codes_place():
+    """Где владелец программы увидит код из демо-почты."""
+    import sys
+
+    if getattr(sys, "frozen", False):
+        return "в файле **%LOCALAPPDATA%\\CyberAI Lab\\cyberai.log**"
+
+    return "в **терминале**, где запущен `streamlit run app.py`"
+
+
 def demo_hint(purpose):
     code = ss.get("demo_code_" + purpose)
 
@@ -987,21 +997,19 @@ def demo_hint(purpose):
         st.info(
             "🧪 **Демо-режим почты:** письма не отправляются. Из "
             "соображений безопасности код сброса пароля показывается "
-            "только владельцу программы — в терминале сервера."
+            "только владельцу программы — " + codes_place() + "."
         )
         return
 
     if not mailer.is_demo() and mailer.LAST_FALLBACK:
         st.warning(
             "⚠️ Письмо не отправилось (" + str(mailer.LAST_FALLBACK)
-            + "). Код напечатан в **терминале VS Code** — "
-            "введи его оттуда."
+            + "). Код записан " + codes_place() + " — введи его оттуда."
         )
     elif mailer.is_demo():
         st.info(
             "🧪 **Демо-режим почты:** письмо не отправлялось — "
-            "код напечатан в **терминале VS Code**, где запущен "
-            "`streamlit run app.py`."
+            "код записан " + codes_place() + "."
         )
 
 

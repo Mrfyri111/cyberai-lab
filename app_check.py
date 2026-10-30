@@ -25,6 +25,9 @@ def run():
         import sklearn.ensemble  # noqa: F401
         import streamlit  # noqa: F401
 
+        if os.name == "nt":
+            import webview  # noqa: F401  — окно приложения
+
         import cyberai_engine
         import database  # noqa: F401
         import demo_traffic
