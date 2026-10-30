@@ -287,6 +287,20 @@ def register_user(username, password, password2, email=None):
     return True, "Аккаунт создан! Теперь войди под своим логином."
 
 
+def create_guest_user():
+    """Временный аккаунт для знакомства с программой без регистрации."""
+    for _ in range(10):
+        username = "guest-" + secrets.token_hex(3)
+        password = secrets.token_urlsafe(24)
+        ok, _ = register_user(username, password, password)
+
+        if ok:
+            user, _ = authenticate(username, password)
+            return user
+
+    return None
+
+
 def authenticate(username, password):
     """Вход по логину или по почте."""
     username = username.strip()

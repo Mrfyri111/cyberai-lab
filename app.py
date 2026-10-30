@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import re
 import threading
 import time
@@ -13,6 +14,7 @@ import streamlit.components.v1 as components
 from openai import OpenAI
 
 import database
+import demo_traffic
 import mailer
 from cyberai_engine import (
     CyberAIEngine,
@@ -129,6 +131,11 @@ smtp_port = 465
 user = ""
 password = ""
 sender_name = "CyberAI Lab"
+
+# Необязательно: общий Groq-ключ, чтобы AI-чат работал у всех
+# пользователей без своего ключа (например, на демо-сервере).
+[groq]
+api_key = ""
 """
 
 
@@ -634,8 +641,10 @@ def history_frame(rows, minutes=None):
         if name in df.columns:
             df[name] = pd.to_numeric(df[name], errors="coerce").fillna(0)
 
-    if minutes:
-        cutoff = datetime.now() - timedelta(minutes=minutes)
+    if minutes and not df.empty:
+        # От последней точки, а не от «сейчас» — так работают
+        # и живой захват, и анализ старой записи.
+        cutoff = df["Метка"].max() - timedelta(minutes=minutes)
         df = df[df["Метка"] >= cutoff]
 
     return df
@@ -726,6 +735,7 @@ def logout():
         "user", "groq_key", "chat_history", "pdf_bytes",
         "pdf_source", "interfaces", "engine_msg", "session_token",
         "email_change", "reset_email", "reg_pending",
+        "demo_code_register", "demo_code_change", "capture_source",
     ]:
         ss.pop(key, None)
 
@@ -756,12 +766,31 @@ def attempt_registry():
 
 
 def client_key():
-    try:
-        ip = st.context.ip_address
-    except Exception:
-        ip = None
+    """Кто подключается: IP посетителя (в облаке — из заголовка
+    прокси). Если IP не виден — отдельный ключ на каждую вкладку,
+    чтобы ограничения не срабатывали сразу для всех посетителей."""
+    ip = None
 
-    return ip or "local"
+    try:
+        forwarded = st.context.headers.get("X-Forwarded-For") or ""
+        ip = forwarded.split(",")[0].strip() or None
+    except Exception:
+        pass
+
+    if not ip:
+        try:
+            ip = st.context.ip_address
+        except Exception:
+            ip = None
+
+    if ip:
+        return ip
+
+    if "client_id" not in ss:
+        import secrets as _secrets
+        ss.client_id = "tab-" + _secrets.token_hex(8)
+
+    return ss.client_id
 
 
 def recent_events(key):
@@ -912,6 +941,28 @@ def render_login_form():
         key="btn_to_reset",
     )
 
+    st.divider()
+
+    if st.button(
+        "👤 Войти как гость — без регистрации",
+        width="stretch",
+        key="btn_guest",
+        help="Временный аккаунт, чтобы быстро посмотреть программу.",
+    ):
+        if len(recent_events("guest:" + key)) >= REGISTER_MAX:
+            st.error("Слишком много гостевых входов. Попробуй позже.")
+        else:
+            user = database.create_guest_user()
+
+            if user:
+                add_event("guest:" + key)
+                ss.pop("skip_restore", None)
+                login(user)
+                ss.capture_source = SOURCE_DEMO
+                st.rerun()
+            else:
+                st.error("Не удалось создать гостевой аккаунт.")
+
 
 MAIL_MAX_PER_DEVICE = 10
 
@@ -920,7 +971,24 @@ def set_auth_mode(mode):
     ss.auth_mode = mode
 
 
-def demo_hint():
+def demo_hint(purpose):
+    code = ss.get("demo_code_" + purpose)
+
+    if mailer.is_demo() and code and purpose in ("register", "change"):
+        st.info(
+            f"🧪 **Демо-режим почты:** настоящие письма не отправляются. "
+            f"Твой код: **{code}**"
+        )
+        return
+
+    if mailer.is_demo() and purpose == "reset":
+        st.info(
+            "🧪 **Демо-режим почты:** письма не отправляются. Из "
+            "соображений безопасности код сброса пароля показывается "
+            "только владельцу программы — в терминале сервера."
+        )
+        return
+
     if not mailer.is_demo() and mailer.LAST_FALLBACK:
         st.warning(
             "⚠️ Письмо не отправилось (" + str(mailer.LAST_FALLBACK)
@@ -956,6 +1024,12 @@ def send_code_to(email, purpose, key):
     if not error:
         add_event("mail:" + key)
 
+        # В демо-режиме код регистрации показываем на экране,
+        # чтобы сайтом можно было пользоваться без почты.
+        # Код сброса пароля — никогда (иначе любой сбросит чужой пароль).
+        if mailer.is_demo() and purpose in ("register", "change"):
+            ss["demo_code_" + purpose] = code
+
     return error
 
 
@@ -970,7 +1044,7 @@ def render_register_form():
             f"📨 Код отправлен на **{database.mask_email(pending['email'])}**. "
             "Проверь почту (и папку «Спам»)."
         )
-        demo_hint()
+        demo_hint("register")
 
         with st.form("reg_code_form"):
             code = st.text_input(
@@ -1226,7 +1300,7 @@ def render_reset_form():
         f"📨 Если почта **{database.mask_email(email)}** привязана к "
         "аккаунту, код уже в пути. Проверь и папку «Спам»."
     )
-    demo_hint()
+    demo_hint("reset")
 
     with st.form("reset_code_form"):
         code = st.text_input(
@@ -1583,8 +1657,24 @@ def clean_answer(text):
     return text.strip()
 
 
+def server_groq_key():
+    """Общий ключ владельца сервера (необязательно), из secrets.toml:
+    [groq]
+    api_key = "gsk_..."
+    """
+    try:
+        section = st.secrets.get("groq") or {}
+        return str(section.get("api_key") or "").strip()
+    except Exception:
+        return ""
+
+
+def active_groq_key():
+    return (ss.get("groq_key") or "").strip() or server_groq_key()
+
+
 def ask_ai(question, data, force_network=False):
-    key = (ss.get("groq_key") or "").strip()
+    key = active_groq_key()
 
     if not key:
         raise ValueError("Подключи Groq API Key в ⚙️ Настройках.")
@@ -1989,6 +2079,114 @@ def create_pdf(history, meta):
 # SIDEBAR
 # ============================================================
 
+SOURCE_LIVE = "📡 Мой ПК"
+SOURCE_DEMO = "🎬 Демо"
+SOURCE_FILE = "📂 Файл"
+SOURCES = [SOURCE_LIVE, SOURCE_DEMO, SOURCE_FILE]
+
+DEMO_SPEED = 3          # демо проигрывается в 3 раза быстрее
+UPLOAD_LIMIT_MB = 50
+
+
+def live_capture_available(user):
+    path = database.get_settings(user["id"])["tshark_path"] or find_tshark()
+    return bool(path) and os.path.isfile(path)
+
+
+def demo_pcap_path():
+    path = database.DATA_DIR / "demo_traffic.pcap"
+
+    if not path.exists():
+        database.DATA_DIR.mkdir(parents=True, exist_ok=True)
+        demo_traffic.write_demo_pcap(str(path))
+
+    return str(path)
+
+
+def render_source_picker(user):
+    live_ok = live_capture_available(user)
+
+    if ss.get("capture_source") not in SOURCES:
+        ss.capture_source = SOURCE_LIVE if live_ok else SOURCE_DEMO
+
+    st.segmented_control(
+        "Источник трафика",
+        options=SOURCES,
+        key="capture_source",
+        selection_mode="single",
+        width="stretch",
+    )
+
+    source = ss.capture_source or SOURCE_DEMO
+
+    if source == SOURCE_LIVE and not live_ok:
+        st.caption(
+            "⚠️ На этом компьютере нет Wireshark (TShark), поэтому "
+            "живой захват недоступен. Выбери 🎬 Демо или 📂 Файл."
+        )
+    elif source == SOURCE_LIVE:
+        st.caption("Живой захват трафика этого компьютера через TShark.")
+    elif source == SOURCE_DEMO:
+        st.caption(
+            "Записанный трафик домашней сети с 4 атаками: "
+            "сканирование портов, всплеск загрузки, ARP-спуфинг, "
+            f"SYN-flood. Проигрывается ×{DEMO_SPEED} (~2 мин)."
+        )
+    else:
+        uploaded = st.file_uploader(
+            "Запись трафика (.pcap / .pcapng)",
+            type=["pcap", "pcapng", "cap"],
+            key="pcap_upload",
+            help="Сохрани трафик в Wireshark (File → Save As) или "
+                 "на Android через приложение PCAPdroid.",
+        )
+
+        if uploaded is not None:
+            if uploaded.size > UPLOAD_LIMIT_MB * 1024 * 1024:
+                st.error(f"Файл больше {UPLOAD_LIMIT_MB} МБ.")
+                ss.pop("upload_path", None)
+            else:
+                folder = database.DATA_DIR / "uploads"
+                folder.mkdir(parents=True, exist_ok=True)
+                target = folder / f"user_{user['id']}.pcap"
+                target.write_bytes(uploaded.getvalue())
+                ss.upload_path = str(target)
+                ss.upload_name = uploaded.name
+        else:
+            ss.pop("upload_path", None)
+
+
+def start_capture(user, engine):
+    source = ss.get("capture_source") or SOURCE_DEMO
+
+    if source == SOURCE_DEMO:
+        engine.start_replay(
+            demo_pcap_path(),
+            source="demo",
+            speed=DEMO_SPEED,
+            label="демо-трафик",
+        )
+    elif source == SOURCE_FILE:
+        path = ss.get("upload_path")
+
+        if not path:
+            raise ValueError("Сначала загрузи файл .pcap или .pcapng.")
+
+        engine.start_replay(
+            path,
+            source="file",
+            speed=0,
+            label=ss.get("upload_name") or "файл",
+        )
+    else:
+        settings = database.get_settings(user["id"])
+        engine.start(
+            settings["tshark_path"] or find_tshark(),
+            settings["interface"],
+            baseline=database.load_baseline(user["id"]),
+        )
+
+
 @st.fragment(run_every="1s")
 def sidebar_controls():
     user = current_user()
@@ -2009,12 +2207,19 @@ def sidebar_controls():
 
         started = data.get("started_at")
 
-        if isinstance(started, datetime):
+        if data.get("source") in ("demo", "file"):
+            st.progress(
+                float(data.get("replay_progress") or 0),
+                text=f"Проигрывается: {data.get('source_label')}",
+            )
+        elif isinstance(started, datetime):
             seconds = int((datetime.now() - started).total_seconds())
             st.caption(
                 f"Интерфейс {data.get('interface')} • "
                 f"работает {seconds // 60} мин {seconds % 60} с"
             )
+    elif data.get("replay_finished"):
+        st.success(f"✅ Запись проанализирована: {data.get('source_label')}")
     else:
         st.warning("● Мониторинг остановлен")
 
@@ -2027,14 +2232,8 @@ def sidebar_controls():
             disabled=running or stopping,
             key="btn_start",
         ):
-            settings = database.get_settings(user["id"])
-
             try:
-                engine.start(
-                    settings["tshark_path"] or find_tshark(),
-                    settings["interface"],
-                    baseline=database.load_baseline(user["id"]),
-                )
+                start_capture(user, engine)
                 ss.engine_msg = ""
             except Exception as exc:
                 ss.engine_msg = str(exc)
@@ -2084,6 +2283,7 @@ def render_sidebar(user):
 
         st.divider()
         st.subheader("Управление мониторингом")
+        render_source_picker(user)
         sidebar_controls()
 
         st.divider()
@@ -2091,6 +2291,9 @@ def render_sidebar(user):
 
         if ss.get("groq_key"):
             st.success("Ключ подключён")
+        elif server_groq_key():
+            st.success("Работает общий ключ сервера")
+            st.caption("Можно подключить свой — в ⚙️ Настройках.")
         else:
             st.info("Ключ не указан")
             st.button(
@@ -2102,7 +2305,7 @@ def render_sidebar(user):
             )
 
         st.divider()
-        st.caption("Capture: TShark")
+        st.caption("Capture: TShark / pcap")
         st.caption("Detection: Rules + Isolation Forest")
         st.caption("AI: Groq")
 
@@ -2236,8 +2439,11 @@ def live_monitor():
         )
 
     # ---------- Диагностика: почему 0 пакетов ----------
+    replay = data.get("source") in ("demo", "file")
+
     no_traffic = (
         running
+        and not replay
         and elapsed >= 8
         and stats["raw_lines"] == 0
     )
@@ -2271,10 +2477,23 @@ def live_monitor():
             "разобрать. Пришли мне этот пример строки:"
         )
         st.code(stats["last_bad_line"] or "(пусто)")
+    elif running and replay:
+        st.success(
+            f"🎬 Проигрывается запись: {data.get('source_label')} "
+            f"({int(float(data.get('replay_progress') or 0) * 100)}%)"
+        )
     elif running:
         st.success("🟢 Захват трафика активен")
+    elif data.get("replay_finished"):
+        st.success(
+            f"✅ Запись «{data.get('source_label')}» проанализирована. "
+            "Все найденные угрозы — в 🚨 Центре угроз."
+        )
     else:
-        st.info("Мониторинг остановлен. Нажми ▶ Старт в боковой панели.")
+        st.info(
+            "Мониторинг остановлен. В боковой панели выбери источник "
+            "(📡 Мой ПК, 🎬 Демо или 📂 Файл) и нажми ▶ Старт."
+        )
 
     if stats["save_error"]:
         st.warning(
@@ -2650,7 +2869,7 @@ def page_ai(user):
     if flash:
         st.success(flash)
 
-    if not ss.get("groq_key"):
+    if not active_groq_key():
         st.info(
             "Чтобы начать беседу, подключи бесплатный ключ Groq — "
             "это займёт 1–2 минуты."
@@ -3012,7 +3231,7 @@ def render_email_settings(user):
         st.markdown(
             f"📨 Код отправлен на **{database.mask_email(pending)}**."
         )
-        demo_hint()
+        demo_hint("change")
 
         with st.form("email_change_code_form"):
             code = st.text_input(

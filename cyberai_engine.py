@@ -23,6 +23,8 @@ from queue import Empty, Full, Queue
 import numpy as np
 from sklearn.ensemble import IsolationForest
 
+import pcap_reader
+
 try:
     import psutil  # необязательно: показывает, какая программа шлёт трафик
 except ImportError:
@@ -419,6 +421,12 @@ class CyberAIEngine:
 
         self.baseline_loaded = False
 
+        # Источник: live — TShark, demo — демо-запись, file — файл.
+        self.source = "live"
+        self.source_label = ""
+        self.replay_finished = False
+        self.replay_progress = 0.0
+
         self.started_at = None
         self.ended_at = None
 
@@ -499,6 +507,158 @@ class CyberAIEngine:
 
         self.normal_buffer.extend(np.array(rows, dtype=float))
         self.baseline_loaded = True
+
+    def start_replay(self, path, source="demo", speed=3.0, label=""):
+        """Проигрывает запись .pcap/.pcapng вместо живого захвата.
+
+        speed — во сколько раз быстрее реального времени;
+        0 — максимально быстро (анализ файла).
+        """
+        if not pcap_reader.is_capture_file(path):
+            raise ValueError(
+                "Это не запись трафика. Нужен файл .pcap или .pcapng "
+                "(например, сохранённый в Wireshark)."
+            )
+
+        with self.lock:
+            if self.running or self.stopping:
+                return False
+
+            self.stop_event = threading.Event()
+            self.queue = Queue(maxsize=50000)
+            self._reset_state()
+
+            self.source = source
+            self.source_label = label or os.path.basename(path)
+            self.interface = self.source_label
+            self.started_at = datetime.now()
+            self.session_id = (
+                f"{source}_" + self.started_at.strftime("%Y%m%d_%H%M%S")
+            )
+
+            self.running = True
+            self.stopping = False
+
+            self.worker = threading.Thread(
+                target=self._run_replay,
+                args=(path, float(speed or 0)),
+                daemon=True,
+            )
+            self.worker.start()
+
+            return True
+
+    def _run_replay(self, path, speed):
+        w = WINDOW_SECONDS
+        packets = []
+        first_ts = None
+        window_ts = None
+        second_ts = None
+        wall_start = time.monotonic()
+
+        # Демо выглядит «живым» (время = сейчас),
+        # у файла — настоящее время записи.
+        use_wallclock = self.source == "demo"
+
+        def stamp(ts):
+            if use_wallclock:
+                return datetime.now()
+            return datetime.fromtimestamp(ts)
+
+        try:
+            all_packets = list(pcap_reader.iter_packets(path, FIELD_KEYS))
+
+            if not all_packets:
+                raise RuntimeError("В записи нет ни одного пакета.")
+
+            total = len(all_packets)
+            last_ts = all_packets[-1]["time"]
+
+            for index, packet in enumerate(all_packets):
+                if self.stop_event.is_set():
+                    break
+
+                ts = packet["time"]
+
+                if first_ts is None:
+                    first_ts = window_ts = second_ts = ts
+
+                # Ждём, чтобы проигрывать в нужном темпе.
+                if speed > 0:
+                    while not self.stop_event.is_set():
+                        delay = (ts - first_ts) / speed - (
+                            time.monotonic() - wall_start
+                        )
+                        if delay <= 0:
+                            break
+                        self.stop_event.wait(min(delay, 0.25))
+
+                    if self.stop_event.is_set():
+                        break
+
+                # Завершаем прошедшие окна (по времени записи).
+                if ts - window_ts > w * 20:
+                    window_ts = ts - ((ts - window_ts) % w)
+
+                while ts - window_ts >= w:
+                    self._finish_window(packets, stamp(window_ts + w))
+                    packets = []
+                    window_ts += w
+
+                # Скорость по секундам записи.
+                if ts - second_ts > 120:
+                    second_ts = ts - ((ts - second_ts) % 1)
+
+                while ts - second_ts >= 1:
+                    with self.lock:
+                        self.rates.append({
+                            "Метка": stamp(second_ts + 1).strftime(
+                                "%Y-%m-%d %H:%M:%S"
+                            ),
+                            "Пакеты/с": self.sec_packets,
+                            "Байты/с": self.sec_bytes,
+                        })
+                        self.current_rate = self.sec_packets
+                        self.sec_packets = 0
+                        self.sec_bytes = 0
+                    second_ts += 1
+
+                packets.append(packet)
+                size = int(packet["size"])
+
+                with self.lock:
+                    self.raw_lines += 1
+                    self.live_packets += 1
+                    self.live_bytes += size
+                    self.sec_packets += 1
+                    self.sec_bytes += size
+
+                    if (
+                        flag_is_set(packet["syn"])
+                        and not flag_is_set(packet["ack"])
+                    ):
+                        self.live_syn += 1
+
+                    self.replay_progress = (index + 1) / total
+
+            if packets and not self.stop_event.is_set():
+                self._finish_window(packets, stamp(last_ts))
+                packets = []
+
+            with self.lock:
+                if not self.stop_event.is_set():
+                    self.replay_finished = True
+                    self.replay_progress = 1.0
+
+        except Exception as error:
+            with self.lock:
+                self.error = f"Не удалось прочитать запись: {error}"
+
+        finally:
+            with self.lock:
+                self.ended_at = datetime.now()
+                self.running = False
+                self.stopping = False
 
     def stop(self):
         with self.lock:
@@ -802,7 +962,7 @@ class CyberAIEngine:
         self.windows_since_fit = 0
         self.last_retrain = datetime.now()
 
-        if notify and self.on_fit is not None:
+        if notify and self.on_fit is not None and self.source == "live":
             try:
                 self.on_fit([[round(float(v), 5) for v in row] for row in x])
             except Exception as exc:
@@ -966,7 +1126,7 @@ class CyberAIEngine:
             reverse=True,
         )[:TOP_TALKERS]
 
-        programs = self._process_map()
+        programs = self._process_map() if self.source == "live" else {}
         result = []
 
         for ip, item in top:
@@ -1007,7 +1167,7 @@ class CyberAIEngine:
 
         return name
 
-    def _finish_window(self, packets):
+    def _finish_window(self, packets, stamp=None):
         self._learn_names(packets)
         talkers = self._talkers(packets)
 
@@ -1079,7 +1239,7 @@ class CyberAIEngine:
                 f"{self.talker_label(top)} — {top['Доля']}% пакетов"
             )
 
-        now = datetime.now()
+        now = stamp or datetime.now()
 
         record = {
             "Метка": now.strftime("%Y-%m-%d %H:%M:%S"),
@@ -1321,4 +1481,8 @@ class CyberAIEngine:
                 "baseline_loaded": self.baseline_loaded,
                 "latest_talkers": list(self.latest_talkers),
                 "psutil": psutil is not None,
+                "source": self.source,
+                "source_label": self.source_label,
+                "replay_finished": self.replay_finished,
+                "replay_progress": self.replay_progress,
             }
