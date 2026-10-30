@@ -225,6 +225,12 @@ section[data-testid="stSidebar"] {
         transform 0.35s cubic-bezier(.4,0,.2,1) !important;
 }
 
+/* Место под кнопку ⟨ в левом верхнем углу */
+section[data-testid="stSidebar"] [data-testid="stSidebarContent"],
+section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] {
+    padding-top: 2.6rem;
+}
+
 body.cy-sidebar-hidden section[data-testid="stSidebar"] {
     width: 0 !important;
     min-width: 0 !important;
@@ -580,6 +586,21 @@ def num(value):
 
 def pretty(value):
     return f"{int(num(value)):,}".replace(",", " ")
+
+
+def pretty_bytes(value):
+    """271300512 -> «271 МБ» — коротко, чтобы влезало в карточку."""
+    size = num(value)
+
+    for unit in ("Б", "КБ", "МБ", "ГБ"):
+        if abs(size) < 1000 or unit == "ГБ":
+            if unit == "Б":
+                return f"{int(size)} {unit}"
+            text = f"{size:.1f}".replace(".", ",").removesuffix(",0")
+            return f"{text} {unit}"
+        size /= 1000
+
+    return f"{size:.1f} ТБ"
 
 
 def fmt_score(value):
@@ -1937,7 +1958,7 @@ def create_pdf(history, meta):
         ["Период", period],
         ["Интервалов анализа", str(stats["intervals"])],
         ["Обработано пакетов", pretty(stats["packets"])],
-        ["Обработано байт", pretty(stats["bytes"])],
+        ["Объём трафика", pretty_bytes(stats["bytes"])],
         ["TCP SYN", pretty(stats["syn"])],
         ["Аномальных интервалов", str(stats["anomalies"])],
         ["Высокий уровень угрозы", str(stats["high"])],
@@ -2561,7 +2582,7 @@ def live_monitor():
 
     m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("Пакеты", pretty(stats["packets"] + stats["live_packets"]))
-    m2.metric("Байты", pretty(stats["bytes"] + stats["live_bytes"]))
+    m2.metric("Трафик", pretty_bytes(stats["bytes"] + stats["live_bytes"]))
     m3.metric(
         "⚡ Скорость",
         f"{pretty(stats['current_rate'])} пак/с",
@@ -2802,7 +2823,7 @@ def render_threat_card(item):
 
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Пакеты", pretty(item.get("Пакеты")))
-        c2.metric("Байты", pretty(item.get("Байты")))
+        c2.metric("Трафик", pretty_bytes(item.get("Байты")))
         c3.metric("SYN", pretty(item.get("SYN")))
         c4.metric("Порты", pretty(item.get("Порты")))
 
