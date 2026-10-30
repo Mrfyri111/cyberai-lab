@@ -1706,6 +1706,9 @@ def server_groq_key():
         return ""
 
 
+SHARED_AI_LIMIT = 15  # сообщений за 10 минут на общем ключе
+
+
 def active_groq_key():
     return (ss.get("groq_key") or "").strip() or server_groq_key()
 
@@ -3060,7 +3063,15 @@ def page_ai(user):
 
     with left:
         st.subheader("🤖 CyberAI Assistant")
-        st.caption(f"Модель {GROQ_MODEL} через Groq")
+        if (ss.get("groq_key") or "").strip():
+            st.caption(f"Модель {GROQ_MODEL} через Groq • твой ключ")
+        elif server_groq_key():
+            st.caption(
+                f"Модель {GROQ_MODEL} через Groq • общий ключ сайта "
+                f"(до {SHARED_AI_LIMIT} сообщений за 10 мин)"
+            )
+        else:
+            st.caption(f"Модель {GROQ_MODEL} через Groq")
 
     with right:
         if st.button("🗑️ Очистить", width="stretch"):
@@ -3135,6 +3146,22 @@ def page_ai(user):
 
     if not question:
         return
+
+    # Общий ключ сервера: ограничиваем, чтобы один человек
+    # не израсходовал весь лимит Groq.
+    if not (ss.get("groq_key") or "").strip() and server_groq_key():
+        limit_key = f"ai:{user['id']}"
+
+        if len(recent_events(limit_key)) >= SHARED_AI_LIMIT:
+            st.warning(
+                f"⏳ На общем ключе можно отправить {SHARED_AI_LIMIT} "
+                "сообщений за 10 минут. Подожди немного или подключи "
+                "свой бесплатный ключ в ⚙️ Настройках — тогда "
+                "ограничения не будет."
+            )
+            return
+
+        add_event(limit_key)
 
     with st.chat_message("user"):
         st.markdown(question)
