@@ -5,8 +5,8 @@ CyberAI Lab — чтение записей трафика (.pcap / .pcapng) б�
 разбирает пакеты на чистом Python и выдаёт те же поля,
 что движок получает от TShark (см. FIELDS в cyberai_engine.py).
 
-Поддерживается: Ethernet (+VLAN), Linux cooked (SLL/SLL2), raw IP,
-loopback; IPv4/IPv6, TCP, UDP, ICMP/ICMPv6, ARP, DNS, TLS SNI, HTTP Host.
+Поддерживается: Ethernet (+VLAN), Wi-Fi 802.11, Linux cooked (SLL/SLL2),
+raw IP, loopback, а также смешанные записи Windows pktmon; IPv4/IPv6, TCP, UDP, ICMP/ICMPv6, ARP, DNS, TLS SNI, HTTP Host.
 """
 
 import ipaddress
@@ -201,6 +201,13 @@ def _parse_dns(payload, out):
         offset += rdlen
 
 
+HOST_CHARS = set(b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_")
+
+
+def _valid_hostname(raw):
+    return 1 <= len(raw) <= 253 and all(ch in HOST_CHARS for ch in raw)
+
+
 def _parse_tls_sni(payload):
     # TLS record: тип 22 (handshake), ClientHello (1)
     if len(payload) < 43 or payload[0] != 0x16 or payload[5] != 0x01:
@@ -220,7 +227,14 @@ def _parse_tls_sni(payload):
 
             if ext_type == 0:  # server_name
                 name_len = struct.unpack(">H", payload[pos + 3:pos + 5])[0]
-                return payload[pos + 5:pos + 5 + name_len].decode("ascii", "replace")
+                raw = payload[pos + 5:pos + 5 + name_len]
+
+                # Имя разорвано между пакетами — лучше не показывать
+                # обрезок вроде «a.nel.cloudfla».
+                if len(raw) < name_len or not _valid_hostname(raw):
+                    return ""
+
+                return raw.decode("ascii")
 
             pos += ext_len
     except (IndexError, struct.error):
@@ -285,6 +299,8 @@ def _parse_ipv4(packet, out):
 
     ihl = (packet[0] & 0x0F) * 4
     proto = packet[9]
+    out["_iplen"] = struct.unpack(">H", packet[2:4])[0]
+    out["_ipcap"] = len(packet)
     out["src"] = str(ipaddress.IPv4Address(packet[12:16]))
     out["dst"] = str(ipaddress.IPv4Address(packet[16:20]))
 
@@ -298,6 +314,8 @@ def _parse_ipv6(packet, out):
     if len(packet) < 40:
         return
 
+    out["_iplen"] = struct.unpack(">H", packet[4:6])[0] + 40
+    out["_ipcap"] = len(packet)
     out["src6"] = str(ipaddress.IPv6Address(packet[8:24]))
     out["dst6"] = str(ipaddress.IPv6Address(packet[24:40]))
 
@@ -336,21 +354,127 @@ def _parse_ethertype(ethertype, packet, out):
         _parse_arp(packet, out)
 
 
+def _looks_like_raw_ip(frame, orig_len):
+    """Пакет без Ethernet-заголовка (VPN, виртуальные адаптеры)."""
+    if len(frame) < 20:
+        return False
+
+    version = frame[0] >> 4
+    size = orig_len or len(frame)
+
+    if version == 4 and (frame[0] & 0x0F) >= 5:
+        ihl = (frame[0] & 0x0F) * 4
+        total = struct.unpack(">H", frame[2:4])[0]
+
+        if total == size or total == len(frame):
+            return True
+
+        # Пакет обрезан записью: проверяем контрольную сумму заголовка
+        # (у исходящих пакетов она бывает нулевой — её считает сетевая карта).
+        if total > len(frame) >= ihl:
+            stored = struct.unpack(">H", frame[10:12])[0]
+            header = frame[:10] + b"\0\0" + frame[12:ihl]
+            return stored == 0 or stored == _ip_checksum(header)
+
+        return False
+
+    if version == 6 and len(frame) >= 40:
+        total = struct.unpack(">H", frame[4:6])[0] + 40
+
+        if total == size or total == len(frame):
+            return True
+
+        return total > len(frame) and frame[6] in (0, 6, 17, 43, 44, 58, 60) \
+            and frame[7] > 0
+
+    return False
+
+
+def _ip_checksum(header):
+    total = sum(struct.unpack(f">{len(header) // 2}H", header))
+    total = (total >> 16) + (total & 0xFFFF)
+    total += total >> 16
+    return ~total & 0xFFFF
+
+
+def _parse_80211(frame, out):
+    """Кадр Wi-Fi (802.11) с данными. Возвращает True, если разобран."""
+    if len(frame) < 24:
+        return False
+
+    fc0, fc1 = frame[0], frame[1]
+
+    if (fc0 >> 2) & 0x03 != 2 or fc1 & 0x40:
+        # не кадр данных или зашифрован
+        return False
+
+    header = 24
+
+    if fc1 & 0x03 == 0x03:          # ToDS и FromDS — 4-й адрес
+        header += 6
+
+    if fc0 & 0x80:                  # QoS
+        header += 2
+
+        if fc1 & 0x80:              # HT Control
+            header += 4
+
+    llc = frame[header:header + 8]
+
+    if len(llc) < 8 or llc[:3] != b"\xaa\xaa\x03":
+        return False
+
+    ethertype = struct.unpack(">H", llc[6:8])[0]
+    _parse_ethertype(ethertype, frame[header + 8:], out)
+    return True
+
+
+def _looks_like_80211(frame):
+    if len(frame) < 34:
+        return False
+
+    fc0 = frame[0]
+
+    if (fc0 >> 2) & 0x03 != 2 or fc0 & 0x03:   # тип «данные», версия 0
+        return False
+
+    header = 24 + (6 if frame[1] & 0x03 == 0x03 else 0)
+    header += (2 + (4 if frame[1] & 0x80 else 0)) if fc0 & 0x80 else 0
+
+    return frame[header:header + 3] == b"\xaa\xaa\x03"
+
+
+def _parse_ethernet(frame, out):
+    ethertype = struct.unpack(">H", frame[12:14])[0]
+    offset = 14
+
+    while ethertype in (0x8100, 0x88A8) and len(frame) >= offset + 4:
+        ethertype = struct.unpack(">H", frame[offset + 2:offset + 4])[0]
+        offset += 4
+
+    _parse_ethertype(ethertype, frame[offset:], out)
+
+
 def dissect(linktype, frame, orig_len, keys):
     """Возвращает словарь с полями `keys` (строки, как у TShark)."""
     out = dict.fromkeys(keys, "")
     out["size"] = str(orig_len or len(frame))
 
     try:
-        if linktype == 1 and len(frame) >= 14:          # Ethernet
-            ethertype = struct.unpack(">H", frame[12:14])[0]
-            offset = 14
+        if linktype == 1 and len(frame) >= 14:
+            # Windows pktmon помечает всё как Ethernet, хотя внутри бывают
+            # кадры Wi-Fi и «голые» IP-пакеты (VPN). Определяем по содержимому.
+            if _looks_like_raw_ip(frame, orig_len):
+                _parse_ethertype(
+                    0x0800 if frame[0] >> 4 == 4 else 0x86DD, frame, out
+                )
+            elif _looks_like_80211(frame):
+                _parse_80211(frame, out)
+            else:
+                _parse_ethernet(frame, out)
 
-            while ethertype in (0x8100, 0x88A8) and len(frame) >= offset + 4:
-                ethertype = struct.unpack(">H", frame[offset + 2:offset + 4])[0]
-                offset += 4
-
-            _parse_ethertype(ethertype, frame[offset:], out)
+        elif linktype == 105:                            # Wi-Fi 802.11
+            _parse_80211(frame, out)
 
         elif linktype in (101, 12, 14):                  # raw IP
             version = frame[0] >> 4 if frame else 0
@@ -374,6 +498,17 @@ def dissect(linktype, frame, orig_len, keys):
 
     except (IndexError, struct.error, ValueError):
         pass
+
+    # Если запись обрезала пакеты (pktmon --pkt-size), настоящий размер
+    # берём из IP-заголовка: заголовок канала + длина IP-пакета.
+    ip_len = out.pop("_iplen", None)
+    ip_cap = out.pop("_ipcap", None)
+
+    if ip_len and ip_cap is not None:
+        real = (len(frame) - ip_cap) + ip_len
+
+        if real > int(out["size"]):
+            out["size"] = str(real)
 
     return out
 

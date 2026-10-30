@@ -819,11 +819,25 @@ class CyberAIEngine:
             default=(None, 0),
         )
 
-        sweep_src, sweep_targets = max(
-            ((s, len(v)) for s, v in targets_by_src.items()),
-            key=lambda item: item[1],
-            default=(None, 0),
-        )
+        # «Обход сети» — перебор адресов ВНУТРИ одной подсети /24
+        # (192.168.1.1, .2, .3 ...). Браузер за секунды обращается
+        # к десяткам серверов в разных сетях — это норма, не атака.
+        sweep_src, sweep_targets = None, 0
+
+        for source, targets in targets_by_src.items():
+            subnets = defaultdict(int)
+
+            for target in targets:
+                if ":" in target:
+                    prefix = ":".join(target.split(":")[:4])
+                else:
+                    prefix = target.rsplit(".", 1)[0]
+                subnets[prefix] += 1
+
+            biggest = max(subnets.values(), default=0)
+
+            if biggest > sweep_targets:
+                sweep_src, sweep_targets = source, biggest
 
         f["sources"] = len(sources)
         f["destinations"] = len(destinations)
@@ -884,7 +898,8 @@ class CyberAIEngine:
                 2,
                 "Возможный обход сети: "
                 f"{extras['sweep_src']} обратился к "
-                f"{fmt(extras['sweep_targets'])} разным узлам за {w} с",
+                f"{fmt(extras['sweep_targets'])} адресам одной подсети "
+                f"за {w} с",
             ))
 
         if (
