@@ -1562,7 +1562,23 @@ def make_client(key):
     )
 
 
+def make_proxy_client(url):
+    return OpenAI(
+        api_key="cyberai-proxy",
+        base_url=url.rstrip("/") + "/v1",
+        default_headers={"X-CyberAI-App": "1"},
+        timeout=60,
+        max_retries=1,
+    )
+
+
 def explain_ai_error(error):
+    if "Лимит общего ключа" in str(error):
+        return (
+            "Лимит общего ключа: подожди 10 минут или подключи свой "
+            "бесплатный ключ Groq в ⚙️ Настройках."
+        )
+
     if isinstance(error, openai.AuthenticationError):
         return (
             "Неверный Groq API Key. Проверь, что скопировал "
@@ -1708,20 +1724,56 @@ def server_groq_key():
 
 SHARED_AI_LIMIT = 15  # сообщений за 10 минут на общем ключе
 
+# Посредник (Cloudflare Worker) с ключом владельца — для тех, у кого
+# нет своего ключа. Сам ключ в программу не попадает.
+# Код посредника: proxy/groq-worker.js
+DEFAULT_AI_PROXY_URL = ""
+
+
+def ai_proxy_url():
+    try:
+        section = st.secrets.get("ai_proxy") or {}
+        url = str(section.get("url") or "").strip()
+    except Exception:
+        url = ""
+
+    return url or os.environ.get("CYBERAI_AI_PROXY", "").strip() \
+        or DEFAULT_AI_PROXY_URL
+
+
+def ai_mode():
+    """own — свой ключ; server — общий ключ сайта; proxy — посредник."""
+    if (ss.get("groq_key") or "").strip():
+        return "own"
+    if server_groq_key():
+        return "server"
+    if ai_proxy_url():
+        return "proxy"
+    return ""
+
 
 def active_groq_key():
     return (ss.get("groq_key") or "").strip() or server_groq_key()
 
 
-def ask_ai(question, data, force_network=False):
-    key = active_groq_key()
+def ai_available():
+    return bool(ai_mode())
 
-    if not key:
+
+def ask_ai(question, data, force_network=False):
+    mode = ai_mode()
+
+    if not mode:
         raise ValueError("Подключи Groq API Key в ⚙️ Настройках.")
 
     detailed = ss.get("answer_style") == "Подробно"
 
-    response = make_client(key).chat.completions.create(
+    client = (
+        make_proxy_client(ai_proxy_url()) if mode == "proxy"
+        else make_client(active_groq_key())
+    )
+
+    response = client.chat.completions.create(
         model=GROQ_MODEL,
         messages=build_messages(question, data, force_network),
         temperature=0.4,
@@ -2479,8 +2531,8 @@ def render_sidebar(user):
 
         if ss.get("groq_key"):
             st.success("Ключ подключён")
-        elif server_groq_key():
-            st.success("Работает общий ключ сервера")
+        elif ai_mode() in ("server", "proxy"):
+            st.success("AI работает через общий ключ")
             st.caption("Можно подключить свой — в ⚙️ Настройках.")
         else:
             st.info("Ключ не указан")
@@ -3063,11 +3115,11 @@ def page_ai(user):
 
     with left:
         st.subheader("🤖 CyberAI Assistant")
-        if (ss.get("groq_key") or "").strip():
+        if ai_mode() == "own":
             st.caption(f"Модель {GROQ_MODEL} через Groq • твой ключ")
-        elif server_groq_key():
+        elif ai_mode() in ("server", "proxy"):
             st.caption(
-                f"Модель {GROQ_MODEL} через Groq • общий ключ сайта "
+                f"Модель {GROQ_MODEL} через Groq • общий ключ "
                 f"(до {SHARED_AI_LIMIT} сообщений за 10 мин)"
             )
         else:
@@ -3082,7 +3134,7 @@ def page_ai(user):
     if flash:
         st.success(flash)
 
-    if not active_groq_key():
+    if not ai_available():
         st.info(
             "Чтобы начать беседу, подключи бесплатный ключ Groq — "
             "это займёт 1–2 минуты."
@@ -3149,7 +3201,7 @@ def page_ai(user):
 
     # Общий ключ сервера: ограничиваем, чтобы один человек
     # не израсходовал весь лимит Groq.
-    if not (ss.get("groq_key") or "").strip() and server_groq_key():
+    if ai_mode() in ("server", "proxy"):
         limit_key = f"ai:{user['id']}"
 
         if len(recent_events(limit_key)) >= SHARED_AI_LIMIT:
