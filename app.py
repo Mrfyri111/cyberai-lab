@@ -2091,7 +2091,114 @@ SOURCE_FILE = "📂 Файл"
 SOURCES = [SOURCE_LIVE, SOURCE_DEMO, SOURCE_FILE]
 
 DEMO_SPEED = 3          # демо проигрывается в 3 раза быстрее
-UPLOAD_LIMIT_MB = 50
+UPLOAD_LIMIT_MB = 100
+RECORD_SECONDS = 60
+
+# Скрипт для Windows: записывает трафик встроенной утилитой pktmon
+# (есть в Windows 10 2004+ и Windows 11) — ничего ставить не нужно.
+RECORD_BAT_LINES = [
+    "@echo off",
+    "chcp 65001 >nul",
+    "title CyberAI Lab - запись трафика",
+    "setlocal",
+    "",
+    ":: Запись трафика нужна с правами администратора",
+    "net session >nul 2>&1",
+    "if errorlevel 1 (",
+    "  echo Запрашиваю права администратора...",
+    "  powershell -NoProfile -Command \"Start-Process -FilePath '%~f0' -Verb RunAs\"",
+    "  exit /b",
+    ")",
+    "",
+    "where pktmon >nul 2>&1",
+    "if errorlevel 1 (",
+    "  echo [!] В этой версии Windows нет pktmon. Нужна Windows 10 версии 2004+ или Windows 11.",
+    "  pause",
+    "  exit /b 1",
+    ")",
+    "",
+    "for /f \"usebackq delims=\" %%D in (`powershell -NoProfile -Command \"[Environment]::GetFolderPath('Desktop')\"`) do set \"DESK=%%D\"",
+    "set \"ETL=%TEMP%\\cyberai_trace.etl\"",
+    "set \"OUT=%DESK%\\cyberai_trace.pcapng\"",
+    "",
+    "pktmon stop >nul 2>&1",
+    "pktmon filter remove >nul 2>&1",
+    "if exist \"%ETL%\" del /q \"%ETL%\"",
+    "if exist \"%OUT%\" del /q \"%OUT%\"",
+    "",
+    "echo.",
+    "echo  ==============================================",
+    "echo    CyberAI Lab: запись трафика {seconds} секунд",
+    "echo  ==============================================",
+    "echo  Пользуйся интернетом как обычно: сайты, видео, игры.",
+    "echo  Чтобы закончить раньше, нажми любую клавишу.",
+    "echo.",
+    "",
+    "pktmon start --capture --comp nics --pkt-size 0 -f \"%ETL%\" >nul",
+    "if errorlevel 1 (",
+    "  echo [!] Не удалось запустить запись.",
+    "  pause",
+    "  exit /b 1",
+    ")",
+    "",
+    "timeout /t {seconds}",
+    "",
+    "pktmon stop >nul",
+    "echo  Сохраняю запись...",
+    "pktmon etl2pcap \"%ETL%\" -o \"%OUT%\" >nul",
+    "del /q \"%ETL%\" >nul 2>&1",
+    "",
+    "if exist \"%OUT%\" (",
+    "  echo.",
+    "  echo  Готово! На рабочем столе файл cyberai_trace.pcapng",
+    "  echo  Загрузи его на сайт CyberAI Lab: Источник трафика - Файл - Старт.",
+    "  explorer /select,\"%OUT%\"",
+    ") else (",
+    "  echo [!] Не удалось сохранить запись.",
+    ")",
+    "echo.",
+    "pause",
+]
+
+
+def record_bat_bytes(seconds=RECORD_SECONDS):
+    text = "\r\n".join(RECORD_BAT_LINES).replace("{seconds}", str(seconds))
+    return (text + "\r\n").encode("utf-8")
+
+
+def render_record_help():
+    with st.expander("📼 Как записать свой трафик", expanded=True):
+        st.markdown("**💻 Windows — без установки программ:**")
+
+        st.download_button(
+            "⬇️ Скачать запись для Windows",
+            data=record_bat_bytes(),
+            file_name="CyberAI_record_traffic.bat",
+            mime="application/octet-stream",
+            width="stretch",
+            key="btn_record_bat",
+        )
+
+        st.markdown(
+            "1. Открой скачанный файл двойным кликом.\n"
+            "2. Нажми **«Да»** на вопрос о правах администратора.\n"
+            f"3. {RECORD_SECONDS} секунд пользуйся интернетом как обычно.\n"
+            "4. На рабочем столе появится **cyberai_trace.pcapng** — "
+            "загрузи его ниже и нажми **▶ Старт**."
+        )
+
+        st.caption(
+            "Если Windows покажет «Система Windows защитила ваш "
+            "компьютер» — нажми «Подробнее» → «Выполнить в любом "
+            "случае». Скрипт только записывает трафик встроенной "
+            "утилитой pktmon и ничего не отправляет в интернет."
+        )
+
+        st.markdown(
+            "**📱 Android:** приложение **PCAPdroid** (бесплатно, без root) "
+            "→ Start → поработай с приложениями → Stop → сохрани "
+            "файл .pcap и загрузи сюда."
+        )
 
 
 def live_capture_available(user):
@@ -2139,6 +2246,8 @@ def render_source_picker(user):
             f"SYN-flood. Проигрывается ×{DEMO_SPEED} (~2 мин)."
         )
     else:
+        render_record_help()
+
         uploaded = st.file_uploader(
             "Запись трафика (.pcap / .pcapng)",
             type=["pcap", "pcapng", "cap"],
