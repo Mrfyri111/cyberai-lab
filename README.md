@@ -32,7 +32,23 @@
 
 Python 3.13 · Streamlit · TShark · scikit-learn · SQLite · Groq API · ReportLab
 
-## Запуск (Windows)
+## 💻 Скачать для Windows (проще всего)
+
+**[⬇️ CyberAI_Lab.exe](https://github.com/Mrfyri111/cyberai-lab/releases/download/windows-latest/CyberAI_Lab.exe)**
+— скачай, запусти, нажми «Да» на вопрос о правах администратора. Откроется браузер
+с программой, источник **📡 Мой ПК** → **▶ Старт** — живой мониторинг своей сети.
+
+- Python и Wireshark **не нужны**: трафик пишет встроенная утилита Windows `pktmon`
+  (Windows 10 версии 2004+ или Windows 11).
+- Права администратора нужны только для записи трафика.
+- Данные хранятся в `%LOCALAPPDATA%\CyberAI Lab`.
+- Windows может показать «Система Windows защитила ваш компьютер» — программа не подписана:
+  «Подробнее» → «Выполнить в любом случае».
+
+`.exe` собирается автоматически на GitHub Actions при каждом изменении кода
+(`.github/workflows/build-windows.yml`).
+
+## Запуск из исходников (Windows)
 
 1. Установи [Wireshark](https://www.wireshark.org/download.html) вместе с **Npcap**.
 2. Установи зависимости:

@@ -13,7 +13,10 @@ import ipaddress
 import os
 import re
 import shutil
+import atexit
+import ctypes
 import subprocess
+import tempfile
 import threading
 import time
 from collections import defaultdict, deque
@@ -351,6 +354,35 @@ def probe_interfaces(tshark_path, numbers, seconds=3):
     return results
 
 
+PKTMON_CHUNK_SECONDS = 4     # длина одного куска записи pktmon
+PKTMON_PACKET_BYTES = 300    # сколько байт пакета сохранять
+
+
+def find_pktmon():
+    """pktmon встроен в Windows 10 (2004+) и Windows 11."""
+    if os.name != "nt":
+        return ""
+
+    found = shutil.which("pktmon")
+
+    if found:
+        return found
+
+    path = os.path.join(
+        os.environ.get("SystemRoot", r"C:\Windows"), "System32", "pktmon.exe"
+    )
+    return path if os.path.isfile(path) else ""
+
+
+def is_admin():
+    try:
+        if os.name == "nt":
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        return os.geteuid() == 0
+    except Exception:
+        return False
+
+
 def list_interfaces(tshark_path):
     tshark_path = str(tshark_path or "").strip().strip('"')
 
@@ -398,6 +430,89 @@ def list_interfaces(tshark_path):
 # ============================================================
 # ДВИЖОК
 # ============================================================
+
+class _PacketFeed:
+    """Раскладывает пакеты по окнам анализа и секундам графика.
+    Общий для записи, демо и живого захвата через pktmon."""
+
+    def __init__(self, engine, stamp):
+        self.engine = engine
+        self.stamp = stamp
+        self.packets = []
+        self.window_ts = None
+        self.second_ts = None
+        self.last_ts = None
+
+    def new_segment(self):
+        """Начало нового куска записи. Неполная последняя секунда
+        прошлого куска и пауза между кусками не рисуются на графике
+        как провал скорости (пакеты при этом посчитаны)."""
+        with self.engine.lock:
+            self.engine.sec_packets = 0
+            self.engine.sec_bytes = 0
+
+        self.second_ts = None
+
+    def add(self, packet):
+        engine = self.engine
+        w = WINDOW_SECONDS
+        ts = packet["time"]
+        self.last_ts = ts
+
+        if self.window_ts is None:
+            self.window_ts = ts
+
+        if self.second_ts is None:
+            self.second_ts = ts
+
+        # Завершаем прошедшие окна (по времени пакетов).
+        if ts - self.window_ts > w * 20:
+            self.window_ts = ts - ((ts - self.window_ts) % w)
+
+        while ts - self.window_ts >= w:
+            engine._finish_window(self.packets, self.stamp(self.window_ts + w))
+            self.packets = []
+            self.window_ts += w
+
+        # Скорость по секундам.
+        if ts - self.second_ts > 120:
+            self.second_ts = ts - ((ts - self.second_ts) % 1)
+
+        while ts - self.second_ts >= 1:
+            with engine.lock:
+                engine.rates.append({
+                    "Метка": self.stamp(self.second_ts + 1).strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    ),
+                    "Пакеты/с": engine.sec_packets,
+                    "Байты/с": engine.sec_bytes,
+                })
+                engine.current_rate = engine.sec_packets
+                engine.sec_packets = 0
+                engine.sec_bytes = 0
+            self.second_ts += 1
+
+        self.packets.append(packet)
+        size = int(packet["size"])
+
+        with engine.lock:
+            engine.raw_lines += 1
+            engine.live_packets += 1
+            engine.live_bytes += size
+            engine.sec_packets += 1
+            engine.sec_bytes += size
+
+            if flag_is_set(packet["syn"]) and not flag_is_set(packet["ack"]):
+                engine.live_syn += 1
+
+            if "progress" in packet:
+                engine.replay_progress = packet["progress"]
+
+    def flush(self):
+        if self.packets and self.last_ts is not None:
+            self.engine._finish_window(self.packets, self.stamp(self.last_ts))
+            self.packets = []
+
 
 class CyberAIEngine:
     def __init__(self, on_record=None, on_fit=None):
@@ -595,11 +710,7 @@ class CyberAIEngine:
             return True
 
     def _run_replay(self, path, speed):
-        w = WINDOW_SECONDS
-        packets = []
         first_ts = None
-        window_ts = None
-        second_ts = None
         wall_start = time.monotonic()
 
         # Демо выглядит «живым» (время = сейчас),
@@ -611,20 +722,19 @@ class CyberAIEngine:
                 return datetime.now()
             return datetime.fromtimestamp(ts)
 
+        feed = _PacketFeed(self, stamp)
+
         try:
             # Пакеты читаются по одному — даже большой файл
             # не занимает лишнюю память.
-            last_ts = None
-
             for packet in pcap_reader.iter_packets(path, FIELD_KEYS):
                 if self.stop_event.is_set():
                     break
 
                 ts = packet["time"]
-                last_ts = ts
 
                 if first_ts is None:
-                    first_ts = window_ts = second_ts = ts
+                    first_ts = ts
 
                 # Ждём, чтобы проигрывать в нужном темпе.
                 if speed > 0:
@@ -639,57 +749,13 @@ class CyberAIEngine:
                     if self.stop_event.is_set():
                         break
 
-                # Завершаем прошедшие окна (по времени записи).
-                if ts - window_ts > w * 20:
-                    window_ts = ts - ((ts - window_ts) % w)
+                feed.add(packet)
 
-                while ts - window_ts >= w:
-                    self._finish_window(packets, stamp(window_ts + w))
-                    packets = []
-                    window_ts += w
-
-                # Скорость по секундам записи.
-                if ts - second_ts > 120:
-                    second_ts = ts - ((ts - second_ts) % 1)
-
-                while ts - second_ts >= 1:
-                    with self.lock:
-                        self.rates.append({
-                            "Метка": stamp(second_ts + 1).strftime(
-                                "%Y-%m-%d %H:%M:%S"
-                            ),
-                            "Пакеты/с": self.sec_packets,
-                            "Байты/с": self.sec_bytes,
-                        })
-                        self.current_rate = self.sec_packets
-                        self.sec_packets = 0
-                        self.sec_bytes = 0
-                    second_ts += 1
-
-                packets.append(packet)
-                size = int(packet["size"])
-
-                with self.lock:
-                    self.raw_lines += 1
-                    self.live_packets += 1
-                    self.live_bytes += size
-                    self.sec_packets += 1
-                    self.sec_bytes += size
-
-                    if (
-                        flag_is_set(packet["syn"])
-                        and not flag_is_set(packet["ack"])
-                    ):
-                        self.live_syn += 1
-
-                    self.replay_progress = packet.get("progress", 0.0)
-
-            if last_ts is None and not self.stop_event.is_set():
+            if feed.last_ts is None and not self.stop_event.is_set():
                 raise RuntimeError("В записи нет ни одного пакета.")
 
-            if packets and not self.stop_event.is_set():
-                self._finish_window(packets, stamp(last_ts))
-                packets = []
+            if not self.stop_event.is_set():
+                feed.flush()
 
             if self.source == "file" and not self.stop_event.is_set():
                 self._analyze_file()
@@ -704,6 +770,157 @@ class CyberAIEngine:
                 self.error = f"Не удалось прочитать запись: {error}"
 
         finally:
+            with self.lock:
+                self.ended_at = datetime.now()
+                self.running = False
+                self.stopping = False
+
+    # --------------------------------------------------------
+    # Живой захват через pktmon (Windows, без Wireshark)
+    # --------------------------------------------------------
+
+    def start_pktmon(self, pktmon_path=None, baseline=None):
+        pktmon_path = pktmon_path or find_pktmon()
+
+        if not pktmon_path:
+            raise ValueError(
+                "Встроенная утилита pktmon не найдена. Нужна Windows 10 "
+                "(версия 2004 или новее) или Windows 11."
+            )
+
+        if not is_admin():
+            raise ValueError(
+                "Для живого захвата нужны права администратора. Закрой "
+                "программу и запусти её снова: правой кнопкой → "
+                "«Запуск от имени администратора»."
+            )
+
+        with self.lock:
+            if self.running or self.stopping:
+                return False
+
+            self.stop_event = threading.Event()
+            self.queue = Queue(maxsize=50000)
+            self._reset_state()
+
+            self.source = "pktmon"
+            self.source_label = "pktmon"
+            self.interface = "все сетевые карты (pktmon)"
+            self._load_baseline(baseline)
+            self.started_at = datetime.now()
+            self.session_id = self.started_at.strftime("%Y%m%d_%H%M%S")
+
+            self.running = True
+            self.stopping = False
+
+            self.worker = threading.Thread(
+                target=self._run_pktmon,
+                args=(pktmon_path,),
+                daemon=True,
+            )
+            self.worker.start()
+
+            return True
+
+    @staticmethod
+    def _pktmon(pktmon_path, *args, timeout=60):
+        return subprocess.run(
+            [pktmon_path, *args],
+            capture_output=True,
+            text=True,
+            encoding="oem" if os.name == "nt" else "utf-8",
+            errors="replace",
+            timeout=timeout,
+            creationflags=CREATE_NO_WINDOW,
+        )
+
+    def _run_pktmon(self, pktmon_path):
+        folder = tempfile.mkdtemp(prefix="cyberai_")
+        etl = os.path.join(folder, "live.etl")
+        pcap = os.path.join(folder, "live.pcapng")
+
+        def cleanup():
+            for name in (etl, pcap):
+                try:
+                    os.remove(name)
+                except OSError:
+                    pass
+
+        def stop_capture():
+            try:
+                self._pktmon(pktmon_path, "stop", timeout=30)
+            except Exception:
+                pass
+
+        # Если программу закроют посреди записи — всё равно остановить.
+        atexit.register(stop_capture)
+
+        feed = _PacketFeed(self, datetime.fromtimestamp)
+        chunks = 0
+
+        try:
+            stop_capture()
+            self._pktmon(pktmon_path, "filter", "remove", timeout=30)
+
+            while not self.stop_event.is_set():
+                cleanup()
+
+                result = self._pktmon(
+                    pktmon_path, "start", "--capture",
+                    "--comp", "nics",
+                    "--pkt-size", str(PKTMON_PACKET_BYTES),
+                    "-f", etl,
+                )
+
+                if result.returncode != 0:
+                    detail = (result.stdout + " " + result.stderr).strip()
+                    raise RuntimeError(
+                        "pktmon не смог начать запись: "
+                        + (detail.splitlines()[-1] if detail else "без пояснений")
+                    )
+
+                self.stop_event.wait(PKTMON_CHUNK_SECONDS)
+                stop_capture()
+
+                self._pktmon(pktmon_path, "etl2pcap", etl, "-o", pcap)
+
+                if not os.path.isfile(pcap):
+                    if chunks == 0:
+                        raise RuntimeError(
+                            "pktmon не смог сохранить запись. Попробуй "
+                            "запустить программу от имени администратора."
+                        )
+                    continue
+
+                feed.new_segment()
+
+                for packet in pcap_reader.iter_packets(pcap, FIELD_KEYS):
+                    packet.pop("progress", None)
+                    feed.add(packet)
+
+                chunks += 1
+
+            feed.flush()
+
+        except Exception as error:
+            with self.lock:
+                if not self.stop_event.is_set():
+                    self.error = str(error)
+
+        finally:
+            stop_capture()
+            cleanup()
+
+            try:
+                os.rmdir(folder)
+            except OSError:
+                pass
+
+            try:
+                atexit.unregister(stop_capture)
+            except Exception:
+                pass
+
             with self.lock:
                 self.ended_at = datetime.now()
                 self.running = False
@@ -1026,7 +1243,7 @@ class CyberAIEngine:
         self.windows_since_fit = 0
         self.last_retrain = datetime.now()
 
-        if notify and self.on_fit is not None and self.source == "live":
+        if notify and self.on_fit is not None and self.source in ("live", "pktmon"):
             try:
                 self.on_fit([[round(float(v), 5) for v in row] for row in x])
             except Exception as exc:
@@ -1190,7 +1407,9 @@ class CyberAIEngine:
             reverse=True,
         )[:TOP_TALKERS]
 
-        programs = self._process_map() if self.source == "live" else {}
+        programs = (
+            self._process_map() if self.source in ("live", "pktmon") else {}
+        )
         result = []
 
         for ip, item in top:

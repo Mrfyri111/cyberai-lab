@@ -10,9 +10,11 @@ SQLite-база в папке data/:
 import hashlib
 import hmac
 import json
+import os
 import re
 import secrets
 import sqlite3
+import sys
 import threading
 from contextlib import contextmanager
 from datetime import datetime, timedelta
@@ -22,7 +24,19 @@ from cryptography.fernet import Fernet, InvalidToken
 
 
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
+
+
+def _data_dir():
+    # В собранной программе (.exe) файлы распаковываются во временную
+    # папку, поэтому данные храним в папке пользователя Windows.
+    if getattr(sys, "frozen", False):
+        root = os.environ.get("LOCALAPPDATA") or str(Path.home())
+        return Path(root) / "CyberAI Lab" / "data"
+
+    return BASE_DIR / "data"
+
+
+DATA_DIR = _data_dir()
 DB_PATH = DATA_DIR / "cyberai.db"
 SECRET_PATH = DATA_DIR / "secret.key"
 

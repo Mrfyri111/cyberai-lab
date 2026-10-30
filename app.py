@@ -19,7 +19,9 @@ import mailer
 from cyberai_engine import (
     CyberAIEngine,
     WINDOW_SECONDS,
+    find_pktmon,
     find_tshark,
+    is_admin,
     is_capture_device,
     is_loopback,
     list_interfaces,
@@ -2203,9 +2205,21 @@ def render_record_help():
         )
 
 
+EXE_URL = (
+    "https://github.com/Mrfyri111/cyberai-lab/releases/download/"
+    "windows-latest/CyberAI_Lab.exe"
+)
+
+
+def tshark_ready(user):
+    """Wireshark установлен и интерфейс выбран."""
+    settings = database.get_settings(user["id"])
+    path = settings["tshark_path"] or find_tshark()
+    return bool(path) and os.path.isfile(path) and bool(settings["interface"])
+
+
 def live_capture_available(user):
-    path = database.get_settings(user["id"])["tshark_path"] or find_tshark()
-    return bool(path) and os.path.isfile(path)
+    return tshark_ready(user) or bool(find_pktmon())
 
 
 def demo_pcap_path():
@@ -2236,11 +2250,29 @@ def render_source_picker(user):
 
     if source == SOURCE_LIVE and not live_ok:
         st.caption(
-            "⚠️ На этом компьютере нет Wireshark (TShark), поэтому "
-            "живой захват недоступен. Выбери 🎬 Демо или 📂 Файл."
+            "⚠️ Живой мониторинг своего компьютера через сайт "
+            "невозможен — браузер не даёт доступ к сети. Скачай "
+            "программу: она работает на Windows 10/11 без Wireshark."
         )
-    elif source == SOURCE_LIVE:
+        st.link_button(
+            "💻 Скачать CyberAI Lab для Windows",
+            EXE_URL,
+            width="stretch",
+        )
+    elif source == SOURCE_LIVE and tshark_ready(user):
         st.caption("Живой захват трафика этого компьютера через TShark.")
+    elif source == SOURCE_LIVE:
+        st.caption(
+            "Живой захват через встроенную утилиту Windows pktmon — "
+            "Wireshark не нужен. Данные обновляются каждые ~5 секунд."
+        )
+
+        if not is_admin():
+            st.warning(
+                "Нужны права администратора: закрой программу и "
+                "запусти её правой кнопкой → «Запуск от имени "
+                "администратора»."
+            )
     elif source == SOURCE_DEMO:
         st.caption(
             "Записанный трафик домашней сети с 4 атаками: "
@@ -2295,12 +2327,19 @@ def start_capture(user, engine):
             speed=0,
             label=ss.get("upload_name") or "файл",
         )
-    else:
+    elif tshark_ready(user):
         settings = database.get_settings(user["id"])
         engine.start(
             settings["tshark_path"] or find_tshark(),
             settings["interface"],
             baseline=database.load_baseline(user["id"]),
+        )
+    elif find_pktmon():
+        engine.start_pktmon(baseline=database.load_baseline(user["id"]))
+    else:
+        raise ValueError(
+            "Живой захват здесь недоступен: нет ни Wireshark, ни pktmon. "
+            "Выбери 🎬 Демо или 📂 Файл."
         )
 
 
@@ -2332,7 +2371,7 @@ def sidebar_controls():
         elif isinstance(started, datetime):
             seconds = int((datetime.now() - started).total_seconds())
             st.caption(
-                f"Интерфейс {data.get('interface')} • "
+                f"Источник: {data.get('interface')} • "
                 f"работает {seconds // 60} мин {seconds % 60} с"
             )
     elif data.get("replay_finished"):
@@ -2578,6 +2617,12 @@ def live_monitor():
 
     if stats["error"]:
         st.error(str(stats["error"]))
+    elif no_traffic and data.get("source") == "pktmon":
+        st.warning(
+            f"📭 За {elapsed} с pktmon не записал ни одного пакета. "
+            "Проверь, что интернет работает, и что программа запущена "
+            "от имени администратора."
+        )
     elif no_traffic:
         st.warning(
             f"📭 За {elapsed} с на интерфейсе {data.get('interface')} "
