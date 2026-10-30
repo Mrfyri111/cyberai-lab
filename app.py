@@ -2531,15 +2531,26 @@ def live_monitor():
 
     m6, m7, m8, m9 = st.columns(4)
     m6.metric("Интервалы", stats["intervals"])
-    m7.metric(
-        "Модель",
-        "Готова ✅" if stats["trained"]
-        else f"Обучение {trained_count}/{target}",
-    )
+    is_file = data.get("source") == "file"
+
+    if is_file and data.get("replay_finished"):
+        model_text = "Проверено ✅" if stats["trained"] else "Только правила"
+    elif is_file and running:
+        model_text = "Читаю файл…"
+    elif stats["trained"]:
+        model_text = "Готова ✅"
+    else:
+        model_text = f"Обучение {trained_count}/{target}"
+
+    m7.metric("Модель", model_text)
     m8.metric("Текущее окно", pretty(stats["live_packets"]) + " пак.")
     m9.metric("Потеряно пакетов", pretty(stats["dropped"]))
 
-    if running and stats["baseline_loaded"]:
+    if data.get("ml_note") and data.get("replay_finished"):
+        st.caption("🧠 Isolation Forest: " + data["ml_note"] + ".")
+    elif is_file:
+        pass
+    elif running and stats["baseline_loaded"]:
         st.caption(
             "🧠 Модель загружена из прошлых сессий — "
             "обучаться заново не нужно, анализ идёт сразу."

@@ -427,6 +427,11 @@ class CyberAIEngine:
         self.replay_finished = False
         self.replay_progress = 0.0
 
+        # Для анализа файла: все окна копятся, а в конце модель
+        # обучается на всей записи и находит в ней необычные моменты.
+        self.file_windows = []
+        self.ml_note = ""
+
         self.started_at = None
         self.ended_at = None
 
@@ -644,6 +649,9 @@ class CyberAIEngine:
             if packets and not self.stop_event.is_set():
                 self._finish_window(packets, stamp(last_ts))
                 packets = []
+
+            if self.source == "file" and not self.stop_event.is_set():
+                self._analyze_file()
 
             with self.lock:
                 if not self.stop_event.is_set():
@@ -1289,14 +1297,88 @@ class CyberAIEngine:
             self.live_syn = 0
             session_id = self.session_id
 
-        if self.on_record is not None:
-            try:
-                self.on_record(record, session_id)
-                with self.lock:
-                    self.save_error = ""
-            except Exception as exc:
-                with self.lock:
-                    self.save_error = str(exc)
+        if self.source == "file":
+            # Сохраним после итогового анализа всей записи.
+            self.file_windows.append((record, vec, f, list(rules)))
+            return
+
+        self._save_record(record, session_id)
+
+    def _save_record(self, record, session_id):
+        if self.on_record is None:
+            return
+
+        try:
+            self.on_record(record, session_id)
+            with self.lock:
+                self.save_error = ""
+        except Exception as exc:
+            with self.lock:
+                self.save_error = str(exc)
+
+    FILE_MIN_WINDOWS = 8
+
+    def _analyze_file(self):
+        """Итог для файла: Isolation Forest учится на всей записи
+        и отмечает окна, которые сильно выбиваются из неё."""
+        windows = self.file_windows
+        rows = [vec for _, vec, _, rules in windows if not rules]
+
+        if len(rows) >= self.FILE_MIN_WINDOWS:
+            self._fit(rows, notify=False)
+            self.ml_note = (
+                f"модель изучила всю запись ({len(windows)} окон "
+                f"по {WINDOW_SECONDS} с) и проверила каждое окно"
+            )
+        else:
+            self.ml_note = (
+                f"запись короткая ({len(windows)} окон), поэтому её "
+                "проверили только правила; для машинного обучения "
+                f"нужно от {self.FILE_MIN_WINDOWS * WINDOW_SECONDS} с записи"
+            )
+
+        for record, vec, f, rules in windows:
+            # Начинаем только с правил — без отметок промежуточной модели.
+            severity = max((level for level, _ in rules), default=0)
+            reasons = [text for _, text in rules]
+
+            if self.model is not None:
+                x = vec.reshape(1, -1)
+                ml_flag = self.model.predict(x)[0] == -1
+                record["AI Score"] = round(
+                    float(self.model.decision_function(x)[0]), 4
+                )
+
+                deviations = (
+                    self._deviations(vec, f) if ml_flag
+                    else self._deviations(vec, f, Z_STRONG)
+                )
+
+                if deviations:
+                    reasons = reasons + deviations
+                    severity = max(
+                        severity, 2 if len(deviations) >= 2 else 1
+                    )
+
+            status = "АНОМАЛИЯ" if severity > 0 else "НОРМА"
+
+            talkers = record.get("Источники трафика") or []
+
+            if status == "АНОМАЛИЯ" and talkers:
+                top = talkers[0]
+                reasons.append(
+                    "Основной источник трафика: "
+                    f"{self.talker_label(top)} — {top['Доля']}% пакетов"
+                )
+
+            with self.lock:
+                record["Статус"] = status
+                record["Уровень"] = SEVERITY_NAMES[severity]
+                record["Причины"] = " | ".join(reasons)
+
+            self._save_record(record, self.session_id)
+
+        self.file_windows = []
 
     # --------------------------------------------------------
     # Главный цикл
@@ -1500,4 +1582,5 @@ class CyberAIEngine:
                 "source_label": self.source_label,
                 "replay_finished": self.replay_finished,
                 "replay_progress": self.replay_progress,
+                "ml_note": self.ml_note,
             }
