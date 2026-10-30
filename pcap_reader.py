@@ -43,7 +43,7 @@ def _iter_pcap(data):
         if len(frame) < incl:
             break
 
-        yield sec + frac / divisor, linktype, frame, orig
+        yield sec + frac / divisor, linktype, frame, orig, offset
 
 
 def _iter_pcapng(data):
@@ -98,13 +98,13 @@ def _iter_pcapng(data):
             if iface < len(interfaces):
                 linktype, resolution = interfaces[iface]
                 ts = ((high << 32) | low) / resolution
-                yield ts, linktype, body[20:20 + incl], orig
+                yield ts, linktype, body[20:20 + incl], orig, offset
 
         elif block_type == 3 and len(body) >= 4 and interfaces:
             # Simple Packet Block (без времени)
             orig = struct.unpack(endian + "I", body[:4])[0]
             linktype, _ = interfaces[0]
-            yield 0.0, linktype, body[4:4 + orig], orig
+            yield 0.0, linktype, body[4:4 + orig], orig, offset
 
         elif block_type == 2 and len(body) >= 20:
             # Устаревший Packet Block
@@ -114,20 +114,25 @@ def _iter_pcapng(data):
             if iface < len(interfaces):
                 linktype, resolution = interfaces[iface]
                 ts = ((high << 32) | low) / resolution
-                yield ts, linktype, body[20:20 + incl], orig
+                yield ts, linktype, body[20:20 + incl], orig, offset
 
         offset += length
 
 
 def iter_frames(path):
-    """(время, тип канала, байты кадра, исходная длина) для каждого пакета."""
+    """(время, тип канала, байты кадра, исходная длина, доля файла)
+    для каждого пакета."""
     with open(path, "rb") as file:
         data = file.read()
 
-    if data[:4] == b"\x0a\x0d\x0d\x0a":
-        yield from _iter_pcapng(data)
-    else:
-        yield from _iter_pcap(data)
+    total = len(data) or 1
+    frames = (
+        _iter_pcapng(data) if data[:4] == b"\x0a\x0d\x0d\x0a"
+        else _iter_pcap(data)
+    )
+
+    for ts, linktype, frame, orig, offset in frames:
+        yield ts, linktype, frame, orig, min(offset / total, 1.0)
 
 
 # ============================================================
@@ -375,9 +380,10 @@ def dissect(linktype, frame, orig_len, keys):
 
 def iter_packets(path, keys):
     """Все пакеты файла: словарь полей + время в секундах (ключ 'time')."""
-    for ts, linktype, frame, orig in iter_frames(path):
+    for ts, linktype, frame, orig, progress in iter_frames(path):
         packet = dissect(linktype, frame, orig, keys)
         packet["time"] = ts
+        packet["progress"] = progress
         yield packet
 
 

@@ -566,19 +566,16 @@ class CyberAIEngine:
             return datetime.fromtimestamp(ts)
 
         try:
-            all_packets = list(pcap_reader.iter_packets(path, FIELD_KEYS))
+            # Пакеты читаются по одному — даже большой файл
+            # не занимает лишнюю память.
+            last_ts = None
 
-            if not all_packets:
-                raise RuntimeError("В записи нет ни одного пакета.")
-
-            total = len(all_packets)
-            last_ts = all_packets[-1]["time"]
-
-            for index, packet in enumerate(all_packets):
+            for packet in pcap_reader.iter_packets(path, FIELD_KEYS):
                 if self.stop_event.is_set():
                     break
 
                 ts = packet["time"]
+                last_ts = ts
 
                 if first_ts is None:
                     first_ts = window_ts = second_ts = ts
@@ -639,7 +636,10 @@ class CyberAIEngine:
                     ):
                         self.live_syn += 1
 
-                    self.replay_progress = (index + 1) / total
+                    self.replay_progress = packet.get("progress", 0.0)
+
+            if last_ts is None and not self.stop_event.is_set():
+                raise RuntimeError("В записи нет ни одного пакета.")
 
             if packets and not self.stop_event.is_set():
                 self._finish_window(packets, stamp(last_ts))
