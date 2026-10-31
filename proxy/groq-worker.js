@@ -15,8 +15,9 @@
 //   2) Workers & Pages → Create → Worker → вставить этот код → Deploy
 //   3) Worker → Settings → Bindings → Add → D1 database →
 //      Variable name: DB, база: cyberai → Deploy
-//   4) Worker → Settings → Variables and Secrets → Add →
-//      Secret, GROQ_API_KEY = ключ gsk_... → Deploy
+//   4) Ключ: Worker → Settings → Bindings → Add binding → Secrets Store →
+//      создать секрет со значением gsk_..., Variable name: GROQ_API_KEY
+//      (или обычный Secret GROQ_API_KEY в Variables and Secrets)
 //   Таблицы создаются сами при первом запросе.
 //
 // Заблокировать пользователя: D1 → cyberai → Console:
@@ -103,6 +104,22 @@ function validPassword(password, username) {
     return "Пароль не должен содержать логин.";
   }
   return null;
+}
+
+// Ключ Groq: обычный секрет (строка) или привязка Secrets Store
+// (объект с методом get()). Поддерживаем оба способа.
+async function groqKey(env) {
+  const value = env.GROQ_API_KEY;
+  if (!value) return "";
+  if (typeof value === "string") return value;
+  if (typeof value.get === "function") {
+    try {
+      return (await value.get()) || "";
+    } catch {
+      return "";
+    }
+  }
+  return "";
 }
 
 // ------------------------------------------------------------
@@ -305,7 +322,9 @@ async function me(request, env) {
 }
 
 async function chat(request, env, ip) {
-  if (!env.GROQ_API_KEY) {
+  const apiKey = await groqKey(env);
+
+  if (!apiKey) {
     return fail("На сервере не задан секрет GROQ_API_KEY.", 500);
   }
 
@@ -350,7 +369,7 @@ async function chat(request, env, ip) {
   const upstream = await fetch("https://api.groq.com/openai/v1/chat/completions", {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${env.GROQ_API_KEY}`,
+      Authorization: `Bearer ${apiKey}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify(body),
@@ -371,11 +390,14 @@ export default {
     const url = new URL(request.url);
 
     if (request.method === "GET" && url.pathname === "/") {
-      const ready = env.DB && env.GROQ_API_KEY;
+      const hasKey = Boolean(await groqKey(env));
+      const missing = [];
+      if (!env.DB) missing.push("привязка D1 с именем DB");
+      if (!hasKey) missing.push("секрет GROQ_API_KEY");
       return new Response(
-        ready
-          ? "CyberAI Cloud: OK"
-          : "CyberAI Cloud: не настроено — нужны привязка D1 (DB) и секрет GROQ_API_KEY",
+        missing.length
+          ? "CyberAI Cloud: не настроено — нужны: " + missing.join(", ")
+          : "CyberAI Cloud: OK",
         { headers: { "Content-Type": "text/plain; charset=utf-8" } },
       );
     }
