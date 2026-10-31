@@ -18,6 +18,9 @@
 // Или вместо Gmail — сервис рассылки Brevo (без пароля приложения):
 //   BREVO_API_KEY  — Secrets Store: ключ xkeysib-... из Brevo
 //   MAIL_FROM      — Secrets Store: почта отправителя, подтверждённая в Brevo
+// Пока почты нет — тестовый режим (письма не отправляются, коды видны
+// только владельцу в Cloudflare → Worker → Logs → Live):
+//   MAIL_TEST      — Secrets Store или переменная: 1
 // Таблицы создаются сами.
 //
 // Заблокировать пользователя: D1 → cyberai → Console:
@@ -240,6 +243,11 @@ async function sendBrevo(env, key, to, code, purpose) {
 }
 
 async function sendMail(env, to, code, purpose) {
+  if ((await secret(env, "MAIL_TEST")) === "1") {
+    console.log(`[ТЕСТ ПОЧТЫ] код ${code} для ${to} (${purpose})`);
+    return;
+  }
+
   const brevoKey = await secret(env, "BREVO_API_KEY");
   if (brevoKey) return sendBrevo(env, brevoKey, to, code, purpose);
 
@@ -809,7 +817,10 @@ export default {
       const missing = [];
       if (!env.DB) missing.push("привязка D1 с именем DB");
       if (!(await secret(env, "GROQ_API_KEY"))) missing.push("секрет GROQ_API_KEY");
-      if (await secret(env, "BREVO_API_KEY")) {
+      const mailTest = (await secret(env, "MAIL_TEST")) === "1";
+      if (mailTest) {
+        // письма не нужны — коды пишутся в логи
+      } else if (await secret(env, "BREVO_API_KEY")) {
         if (!(await secret(env, "MAIL_FROM"))) missing.push("секрет MAIL_FROM");
       } else {
         if (!(await secret(env, "SMTP_USER"))) missing.push("секрет SMTP_USER (или BREVO_API_KEY)");
@@ -818,7 +829,9 @@ export default {
       return new Response(
         missing.length
           ? "CyberAI Cloud: не настроено — нужны: " + missing.join(", ")
-          : "CyberAI Cloud: OK",
+          : mailTest
+            ? "CyberAI Cloud: OK (тестовый режим почты: коды в Logs)"
+            : "CyberAI Cloud: OK",
         { headers: { "Content-Type": "text/plain; charset=utf-8" } },
       );
     }
