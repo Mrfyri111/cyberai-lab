@@ -49,7 +49,6 @@ jobs:
             --add-data "app.py;." `
             --add-data "cyberai_engine.py;." `
             --add-data "database.py;." `
-            --add-data "mailer.py;." `
             --add-data "pcap_reader.py;." `
             --add-data "demo_traffic.py;." `
             --add-data "app_check.py;." `

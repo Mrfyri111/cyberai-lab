@@ -47,7 +47,6 @@ def _bundled_imports():
     import cyberai_engine  # noqa: F401
     import database  # noqa: F401
     import demo_traffic  # noqa: F401
-    import mailer  # noqa: F401
     import matplotlib.pyplot  # noqa: F401
     import numpy  # noqa: F401
     import openai  # noqa: F401

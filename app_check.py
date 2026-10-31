@@ -31,7 +31,6 @@ def run():
         import cyberai_engine
         import database  # noqa: F401
         import demo_traffic
-        import mailer  # noqa: F401
         import pcap_reader  # noqa: F401
 
         path = os.path.join(tempfile.mkdtemp(), "demo.pcap")

@@ -15,7 +15,6 @@ from openai import OpenAI
 
 import database
 import demo_traffic
-import mailer
 from cyberai_engine import (
     CyberAIEngine,
     WINDOW_SECONDS,
@@ -121,21 +120,9 @@ gatherUsageStats = false
 """
 
 
-SECRETS_TEMPLATE = """# Почта, с которой CyberAI Lab отправляет коды подтверждения.
-# Заполни user и password, сохрани файл — и почта заработает.
-# password — это «пароль приложения» Gmail (16 букв), НЕ обычный пароль.
-# Получить: https://myaccount.google.com/apppasswords
-# НИКОМУ не показывай и не выкладывай этот файл.
+SECRETS_TEMPLATE = """# Необязательно: общий Groq-ключ для онлайн-версии (Streamlit Cloud).
+# В программе для Windows ключ хранится на сервере CyberAI Cloud.
 
-[email]
-smtp_server = "smtp.gmail.com"
-smtp_port = 465
-user = ""
-password = ""
-sender_name = "CyberAI Lab"
-
-# Необязательно: общий Groq-ключ, чтобы AI-чат работал у всех
-# пользователей без своего ключа (например, на демо-сервере).
 [groq]
 api_key = ""
 """
@@ -757,13 +744,17 @@ def logout():
 
     database.delete_session(ss.get("session_token"))
 
+    if ss.get("cloud_token") and user:
+        cloud_call("/api/logout", token=ss.get("cloud_token"))
+        database.save_settings(user["id"], cloud_token="")
+
     for key in [
         "user", "groq_key", "chat_history", "pdf_bytes",
         "pdf_source", "interfaces", "engine_msg", "session_token",
         "email_change", "reset_email", "reg_pending",
         "cloud_token", "cloud_user", "ai_choice", "ai_choice_widget",
         "ai_ai_pick", "settings_ai_pick",
-        "demo_code_register", "demo_code_change", "capture_source",
+        "capture_source", "reset_masked",
     ]:
         ss.pop(key, None)
 
@@ -891,7 +882,45 @@ def password_strength(password):
     return score, labels[score]
 
 
+def set_auth_mode(mode):
+    ss.auth_mode = mode
+
+
+def finish_cloud_login(data, remember):
+    """Сервер подтвердил вход: создаём локальную «копию» аккаунта,
+    сохраняем токен сервера и входим в программу."""
+    user = database.ensure_local_user(data["username"], data.get("email", ""))
+
+    database.save_settings(
+        user["id"],
+        cloud_token=data["token"],
+        cloud_user=data["username"],
+    )
+
+    ss.pop("skip_restore", None)
+    token = None
+
+    if remember:
+        token = database.create_session(user["id"])
+        ss.pending_cookie = token
+
+    login(user, token=token)
+
+
+def server_unavailable_hint():
+    if not cloud_url():
+        st.error(
+            "В программе не указан адрес сервера CyberAI Cloud — вход "
+            "и регистрация невозможны."
+        )
+        return True
+    return False
+
+
 def render_login_form():
+    if server_unavailable_hint():
+        return
+
     key = client_key()
     wait, left = login_block_left(key)
 
@@ -923,45 +952,38 @@ def render_login_form():
         if not username.strip() or not password:
             st.error("Введи логин и пароль.")
         else:
-            user, message = database.authenticate(username, password)
-
-            if user:
-                clear_events("login:" + key)
-                ss.pop("skip_restore", None)
-
-                token = None
-
-                if remember:
-                    token = database.create_session(user["id"])
-                    ss.pending_cookie = token
-
-                login(user, token=token)
-                st.rerun()
-
-            fails = add_event("login:" + key)
-
-            # Каждая следующая ошибка — ответ медленнее.
-            time.sleep(min(0.5 * fails, 3.0))
-
-            left = max(0, LOGIN_MAX_FAILS - fails)
-
-            if left:
-                st.error(f"{message} Осталось попыток: {left}.")
-            else:
-                st.error(
-                    "🔒 Вход с этого устройства заблокирован "
-                    f"на {LOGIN_WINDOW // 60} минут."
+            with st.spinner("Вхожу..."):
+                status, data = cloud_call(
+                    "/api/login",
+                    {"login": username.strip(), "password": password},
                 )
 
-    left, right = st.columns(2)
-    left.button(
+            if status == 200 and data.get("token"):
+                clear_events("login:" + key)
+                finish_cloud_login(data, remember)
+                st.rerun()
+
+            if status == 0:
+                st.error(cloud_error(data))
+            else:
+                fails = add_event("login:" + key)
+                time.sleep(min(0.5 * fails, 3.0))
+                left = max(0, LOGIN_MAX_FAILS - fails)
+
+                if status == 429 or not left:
+                    st.error(cloud_error(data))
+                else:
+                    st.error(f"{cloud_error(data)} Осталось попыток: {left}.")
+
+    left_col, right_col = st.columns(2)
+    left_col.button(
         "📝 Создать аккаунт",
         width="stretch",
         on_click=set_auth_mode,
         args=(AUTH_REGISTER,),
         key="btn_to_register",
     )
-    right.button(
+    right_col.button(
         "🔑 Забыл пароль?",
         width="stretch",
         on_click=set_auth_mode,
@@ -969,125 +991,22 @@ def render_login_form():
         key="btn_to_reset",
     )
 
-    st.divider()
-
-    if st.button(
-        "👤 Войти как гость — без регистрации",
-        width="stretch",
-        key="btn_guest",
-        help="Временный аккаунт, чтобы быстро посмотреть программу.",
-    ):
-        if len(recent_events("guest:" + key)) >= REGISTER_MAX:
-            st.error("Слишком много гостевых входов. Попробуй позже.")
-        else:
-            user = database.create_guest_user()
-
-            if user:
-                add_event("guest:" + key)
-                ss.pop("skip_restore", None)
-                login(user)
-                ss.capture_source = SOURCE_DEMO
-                st.rerun()
-            else:
-                st.error("Не удалось создать гостевой аккаунт.")
-
-
-MAIL_MAX_PER_DEVICE = 10
-
-
-def set_auth_mode(mode):
-    ss.auth_mode = mode
-
-
-def codes_place():
-    """Где владелец программы увидит код из демо-почты."""
-    import sys
-
-    if getattr(sys, "frozen", False):
-        return "в файле **%LOCALAPPDATA%\\CyberAI Lab\\cyberai.log**"
-
-    return "в **терминале**, где запущен `streamlit run app.py`"
-
-
-def demo_hint(purpose):
-    code = ss.get("demo_code_" + purpose)
-
-    if mailer.is_demo() and code and purpose in ("register", "change"):
-        st.info(
-            f"🧪 **Демо-режим почты:** настоящие письма не отправляются. "
-            f"Твой код: **{code}**"
-        )
-        return
-
-    if mailer.is_demo() and purpose == "reset":
-        st.info(
-            "🧪 **Демо-режим почты:** письма не отправляются. Из "
-            "соображений безопасности код сброса пароля показывается "
-            "только владельцу программы — " + codes_place() + "."
-        )
-        return
-
-    if not mailer.is_demo() and mailer.LAST_FALLBACK:
-        st.warning(
-            "⚠️ Письмо не отправилось (" + str(mailer.LAST_FALLBACK)
-            + "). Код записан " + codes_place() + " — введи его оттуда."
-        )
-    elif mailer.is_demo():
-        st.info(
-            "🧪 **Демо-режим почты:** письмо не отправлялось — "
-            "код записан " + codes_place() + "."
-        )
-
-
-def mail_limited(key):
-    """Не больше MAIL_MAX_PER_DEVICE писем с одного устройства за 10 минут."""
-    return len(recent_events("mail:" + key)) >= MAIL_MAX_PER_DEVICE
-
-
-def send_code_to(email, purpose, key):
-    """Создаёт код и отправляет письмо. Возвращает None или ошибку."""
-    if mail_limited(key):
-        return "Слишком много писем с этого устройства. Подожди 10 минут."
-
-    code, error = database.create_email_code(email, purpose)
-
-    if error:
-        return error
-
-    with st.spinner("Отправляю письмо..."):
-        error = mailer.send_code(email, code, purpose)
-
-    if not error:
-        add_event("mail:" + key)
-
-        # В демо-режиме код регистрации показываем на экране,
-        # чтобы сайтом можно было пользоваться без почты.
-        # Код сброса пароля — никогда (иначе любой сбросит чужой пароль).
-        if mailer.is_demo() and purpose in ("register", "change"):
-            ss["demo_code_" + purpose] = code
-
-    return error
-
 
 def render_register_form():
-    key = client_key()
-    use_mail = mailer.mail_configured()
+    if server_unavailable_hint():
+        return
+
     pending = ss.get("reg_pending")
 
-    # ---------- Шаг 2: ввод кода из письма ----------
-    if use_mail and pending:
+    # ---------- Шаг 2: код из письма ----------
+    if pending:
         st.markdown(
-            f"📨 Код отправлен на **{database.mask_email(pending['email'])}**. "
-            "Проверь почту (и папку «Спам»)."
+            f"📨 Код отправлен на **{pending['masked']}**. "
+            "Проверь почту и папку «Спам»."
         )
-        demo_hint("register")
 
         with st.form("reg_code_form"):
-            code = st.text_input(
-                "Код из письма",
-                max_chars=database.CODE_LENGTH,
-                placeholder="123456",
-            )
+            code = st.text_input("Код из письма", max_chars=6, placeholder="123456")
             confirm = st.form_submit_button(
                 "✅ Подтвердить и создать аккаунт",
                 type="primary",
@@ -1095,44 +1014,34 @@ def render_register_form():
             )
 
         if confirm:
-            ok, error = database.verify_email_code(
-                pending["email"], "register", code
-            )
-
-            if not ok:
-                st.error(error)
-            else:
-                ok, message = database.register_user(
-                    pending["username"],
-                    pending["password"],
-                    pending["password"],
-                    email=pending["email"],
+            with st.spinner("Проверяю код..."):
+                status, data = cloud_call(
+                    "/api/register/confirm",
+                    {"email": pending["email"], "code": code},
                 )
 
-                if ok:
-                    add_event("register:" + key)
-                    ss.pop("reg_pending", None)
-                    for name in ("reg_username", "reg_email",
-                                 "reg_password", "reg_password2"):
-                        ss.pop(name, None)
-                    ss.auth_flash = message
-                    ss.auth_mode_next = AUTH_LOGIN
-                    ss.login_prefill = pending["username"]
-                    st.rerun()
-                else:
-                    st.error(message)
-
-        left, right = st.columns(2)
-
-        if left.button("🔁 Отправить код ещё раз", width="stretch"):
-            error = send_code_to(pending["email"], "register", key)
-
-            if error:
-                st.error(error)
+            if status == 200 and data.get("token"):
+                ss.pop("reg_pending", None)
+                for name in ("reg_username", "reg_email",
+                             "reg_password", "reg_password2"):
+                    ss.pop(name, None)
+                finish_cloud_login(data, remember=True)
+                st.rerun()
             else:
-                st.success("Новый код отправлен.")
+                st.error(cloud_error(data))
 
-        if right.button("← Изменить данные", width="stretch"):
+        left_col, right_col = st.columns(2)
+
+        if left_col.button("🔁 Отправить код ещё раз", width="stretch"):
+            with st.spinner("Отправляю письмо..."):
+                status, data = cloud_call("/api/register/start", pending["request"])
+
+            if status == 200:
+                st.success("Новый код отправлен.")
+            else:
+                st.error(cloud_error(data))
+
+        if right_col.button("← Изменить данные", width="stretch"):
             ss.pop("reg_pending", None)
             st.rerun()
 
@@ -1145,46 +1054,24 @@ def render_register_form():
         help="3–32 символа: латинские буквы, цифры, _ . -",
     )
     name = username.strip()
-    name_ok = False
 
     if name:
         error = database.validate_username(name)
-
         if error:
             st.markdown(f":red[❌ {error}]")
-        elif database.username_exists(name):
-            st.markdown(
-                f":red[❌ Логин «{name}» уже занят — придумай другой.]"
-            )
-        else:
-            st.markdown(":green[✅ Логин свободен]")
-            name_ok = True
 
-    email = ""
-    email_ok = not use_mail
+    email = database.normalize_email(st.text_input(
+        "Почта",
+        key="reg_email",
+        placeholder="name@gmail.com",
+        help="На неё придёт код подтверждения. Через неё же можно "
+             "восстановить пароль и входить вместо логина.",
+    ))
 
-    if use_mail:
-        email = database.normalize_email(st.text_input(
-            "Почта",
-            key="reg_email",
-            placeholder="name@gmail.com",
-            help="На неё придёт код подтверждения. Через неё же "
-                 "можно восстановить пароль.",
-        ))
-
-        if email:
-            error = database.validate_email(email)
-
-            if error:
-                st.markdown(f":red[❌ {error}]")
-            elif database.email_exists(email):
-                st.markdown(
-                    ":red[❌ Эта почта уже зарегистрирована. "
-                    "Нажми «🔑 Забыл пароль», если это твой аккаунт.]"
-                )
-            else:
-                st.markdown(":green[✅ Почта подходит]")
-                email_ok = True
+    if email:
+        error = database.validate_email(email)
+        if error:
+            st.markdown(f":red[❌ {error}]")
 
     password = st.text_input(
         "Придумай пароль",
@@ -1206,46 +1093,10 @@ def render_register_form():
     if password2 and password != password2:
         st.markdown(":red[❌ Пароли не совпадают]")
 
-    st.caption("Проверка срабатывает после Enter или Tab.")
-
-    button_text = (
-        "📨 Получить код на почту" if use_mail else "Создать аккаунт"
-    )
-
-    if st.button(
-        button_text,
-        type="primary",
-        width="stretch",
-        disabled=(bool(name) and not name_ok)
-                 or (bool(email) and not email_ok),
-    ):
-        if len(recent_events("register:" + key)) >= REGISTER_MAX:
-            st.error(
-                "Слишком много регистраций с этого устройства. "
-                "Попробуй позже."
-            )
-            return
-
-        if not use_mail:
-            ok, message = database.register_user(name, password, password2)
-
-            if ok:
-                add_event("register:" + key)
-                ss.auth_flash = message
-                ss.auth_mode_next = AUTH_LOGIN
-                ss.login_prefill = name
-                st.rerun()
-            else:
-                st.error(message)
-            return
-
-        # Проверяем всё ДО отправки письма.
+    if st.button("📨 Получить код на почту", type="primary", width="stretch"):
         error = (
             database.validate_username(name)
-            or ("Логин уже занят." if database.username_exists(name) else None)
             or database.validate_email(email)
-            or ("Почта уже зарегистрирована."
-                if database.email_exists(email) else None)
             or ("Пароли не совпадают." if password != password2 else None)
             or database.validate_password(password, name)
         )
@@ -1254,40 +1105,29 @@ def render_register_form():
             st.error(error)
             return
 
-        error = send_code_to(email, "register", key)
+        request = {"username": name, "email": email, "password": password}
 
-        if error:
-            st.error(error)
-            return
+        with st.spinner("Отправляю письмо с кодом..."):
+            status, data = cloud_call("/api/register/start", request)
 
-        ss.reg_pending = {
-            "username": name,
-            "email": email,
-            "password": password,
-        }
-        st.rerun()
+        if status == 200:
+            ss.reg_pending = {
+                "email": email,
+                "masked": data.get("email") or email,
+                "request": request,
+            }
+            st.rerun()
+        else:
+            st.error(cloud_error(data))
 
-    if use_mail:
-        st.caption(
-            "Пароль хранится только в виде хэша — "
-            "даже владелец программы его не увидит."
-        )
-    else:
-        st.caption(
-            "📭 Отправка писем не настроена, поэтому регистрация без "
-            "почты, а «Забыл пароль» недоступен."
-        )
+    st.caption(
+        "Аккаунт хранится на сервере CyberAI Cloud: с ним можно войти "
+        "на любом компьютере, и сразу работает общий ИИ-помощник."
+    )
 
 
 def render_reset_form():
-    key = client_key()
-
-    if not mailer.mail_configured():
-        st.warning(
-            "Восстановление по почте пока не настроено на этом "
-            "компьютере. Владелец программы может включить его в "
-            "файле .streamlit/secrets.toml."
-        )
+    if server_unavailable_hint():
         return
 
     email = ss.get("reset_email")
@@ -1315,35 +1155,26 @@ def render_reset_form():
                 st.error(error)
                 return
 
-            # Не раскрываем, есть ли такой аккаунт: ответ всегда одинаковый.
-            if database.get_user_by_email(value):
-                error = send_code_to(value, "reset", key)
+            with st.spinner("Отправляю письмо..."):
+                status, data = cloud_call("/api/reset/start", {"email": value})
 
-                if error:
-                    st.error(error)
-                    return
+            if status == 200:
+                ss.reset_email = value
+                ss.reset_masked = data.get("email") or value
+                st.rerun()
             else:
-                add_event("mail:" + key)
-                time.sleep(1.0)
-
-            ss.reset_email = value
-            st.rerun()
+                st.error(cloud_error(data))
 
         return
 
     # ---------- Шаг 2: код + новый пароль ----------
     st.markdown(
-        f"📨 Если почта **{database.mask_email(email)}** привязана к "
-        "аккаунту, код уже в пути. Проверь и папку «Спам»."
+        f"📨 Если почта **{ss.get('reset_masked') or email}** привязана "
+        "к аккаунту, код уже в пути. Проверь и папку «Спам»."
     )
-    demo_hint("reset")
 
     with st.form("reset_code_form"):
-        code = st.text_input(
-            "Код из письма",
-            max_chars=database.CODE_LENGTH,
-            placeholder="123456",
-        )
+        code = st.text_input("Код из письма", max_chars=6, placeholder="123456")
         new = st.text_input("Новый пароль", type="password")
         new2 = st.text_input("Повтори новый пароль", type="password")
         submit = st.form_submit_button(
@@ -1353,52 +1184,43 @@ def render_reset_form():
         )
 
     if submit:
-        user = database.get_user_by_email(email)
-
-        # Сначала проверяем пароль, чтобы не «сжечь» код зря.
-        error = (
-            ("Пароли не совпадают." if new != new2 else None)
-            or database.validate_password(
-                new, user["username"] if user else ""
-            )
-        )
-
-        if error:
-            st.error(error)
+        if new != new2:
+            st.error("Пароли не совпадают.")
         else:
-            ok, error = database.verify_email_code(email, "reset", code)
-
-            if not ok or user is None:
-                st.error(error or "Неверный код.")
-            else:
-                ok, message = database.reset_password_by_email(
-                    email, new, new2
+            with st.spinner("Меняю пароль..."):
+                status, data = cloud_call(
+                    "/api/reset/confirm",
+                    {"email": email, "code": code, "password": new},
                 )
 
-                if ok:
-                    clear_events("login:" + key)
-                    ss.pop("reset_email", None)
-                    ss.auth_flash = message
-                    ss.auth_mode_next = AUTH_LOGIN
-                    ss.login_prefill = user["username"]
-                    st.rerun()
-                else:
-                    st.error(message)
-
-    left, right = st.columns(2)
-
-    if left.button("🔁 Отправить код ещё раз", width="stretch"):
-        if database.get_user_by_email(email):
-            error = send_code_to(email, "reset", key)
-            if error:
-                st.error(error)
+            if status == 200:
+                clear_events("login:" + client_key())
+                ss.pop("reset_email", None)
+                ss.pop("reset_masked", None)
+                ss.auth_flash = (
+                    f"Пароль для «{data.get('username')}» изменён. "
+                    "Теперь войди с новым паролем."
+                )
+                ss.auth_mode_next = AUTH_LOGIN
+                ss.login_prefill = data.get("username") or ""
+                st.rerun()
             else:
-                st.success("Новый код отправлен.")
-        else:
-            st.success("Новый код отправлен.")
+                st.error(cloud_error(data))
 
-    if right.button("← Другая почта", width="stretch"):
+    left_col, right_col = st.columns(2)
+
+    if left_col.button("🔁 Отправить код ещё раз", width="stretch"):
+        with st.spinner("Отправляю письмо..."):
+            status, data = cloud_call("/api/reset/start", {"email": email})
+
+        if status == 200:
+            st.success("Новый код отправлен.")
+        else:
+            st.error(cloud_error(data))
+
+    if right_col.button("← Другая почта", width="stretch"):
         ss.pop("reset_email", None)
+        ss.pop("reset_masked", None)
         st.rerun()
 
 
@@ -1801,7 +1623,7 @@ def ai_choice():
     if choice in ("cloud", "own"):
         return choice
 
-    if (ss.get("groq_key") or "").strip() or not cloud_url():
+    if not cloud_url():
         return "own"
 
     return "cloud"
@@ -1862,81 +1684,12 @@ def ask_ai(question, data, force_network=False):
     return clean_answer(response.choices[0].message.content or "")
 
 
-def save_cloud_login(user, data):
-    ss.cloud_token = data["token"]
-    ss.cloud_user = data.get("username", "")
-    ss.ai_choice = "cloud"
-    database.save_settings(
-        user["id"],
-        cloud_token=data["token"],
-        cloud_user=ss.cloud_user,
-        ai_mode="cloud",
+def render_relogin_hint():
+    st.warning(
+        "Вход на сервере CyberAI Cloud истёк. Выйди из аккаунта и войди "
+        "снова — общий ИИ заработает."
     )
-
-
-def render_cloud_login(prefix, user):
-    st.markdown(
-        "**Общий ИИ CyberAI** — бесплатно, свой ключ не нужен. Нужен "
-        "аккаунт **CyberAI Cloud** (он хранится на сервере, отдельно "
-        "от входа в программу). Лимит: 30 сообщений за 10 минут "
-        "и 300 в сутки."
-    )
-
-    tab_in, tab_up = st.tabs(["Вход", "Регистрация"])
-
-    with tab_in:
-        with st.form(f"{prefix}_cloud_login"):
-            name = st.text_input("Логин CyberAI Cloud", value=user["username"])
-            password = st.text_input("Пароль", type="password")
-            sent = st.form_submit_button(
-                "Войти", type="primary", width="stretch"
-            )
-
-        if sent:
-            with st.spinner("Вхожу в CyberAI Cloud..."):
-                status, data = cloud_call(
-                    "/api/login", {"username": name, "password": password}
-                )
-
-            if status == 200 and data.get("token"):
-                save_cloud_login(user, data)
-                ss.groq_flash = "Готово! Общий ИИ подключён. 🎉"
-                st.rerun()
-            else:
-                st.error(cloud_error(data))
-
-    with tab_up:
-        with st.form(f"{prefix}_cloud_register"):
-            name = st.text_input(
-                "Придумай логин",
-                value=user["username"] if not user["username"].startswith("guest-") else "",
-                help="3–32 символа: латинские буквы, цифры, _ . -",
-            )
-            password = st.text_input(
-                "Придумай пароль", type="password",
-                help="Минимум 8 символов, буквы и цифры.",
-            )
-            password2 = st.text_input("Повтори пароль", type="password")
-            sent = st.form_submit_button(
-                "Создать аккаунт", type="primary", width="stretch"
-            )
-
-        if sent:
-            if password != password2:
-                st.error("Пароли не совпадают.")
-            else:
-                with st.spinner("Создаю аккаунт в CyberAI Cloud..."):
-                    status, data = cloud_call(
-                        "/api/register",
-                        {"username": name, "password": password},
-                    )
-
-                if status == 200 and data.get("token"):
-                    save_cloud_login(user, data)
-                    ss.groq_flash = "Аккаунт создан, общий ИИ подключён. 🎉"
-                    st.rerun()
-                else:
-                    st.error(cloud_error(data))
+    st.button("🚪 Выйти и войти заново", on_click=logout, key="btn_relogin")
 
 
 def on_ai_choice_change(user_id):
@@ -1970,7 +1723,13 @@ def render_ai_setup(prefix, user):
     )
 
     if (ss.get(key) or AI_CLOUD) == AI_CLOUD:
-        render_cloud_login(prefix, user)
+        if ss.get("cloud_token"):
+            ss.ai_choice = "cloud"
+            database.save_settings(user["id"], ai_mode="cloud")
+            st.success("Общий ИИ подключён к твоему аккаунту.")
+            st.button("Начать беседу", type="primary", key=f"{prefix}_start_cloud")
+        else:
+            render_relogin_hint()
     else:
         render_groq_setup(prefix, user)
 
@@ -1996,10 +1755,13 @@ def render_ai_settings(user, settings):
         token = ss.get("cloud_token")
 
         if not token:
-            render_cloud_login("settings", user)
+            render_relogin_hint()
             return
 
-        st.success(f"Вошёл в CyberAI Cloud как **{ss.get('cloud_user') or '—'}**")
+        st.success(
+            f"🌐 Общий ИИ CyberAI работает через твой аккаунт "
+            f"**{ss.get('cloud_user') or user['username']}**"
+        )
 
         left, right = st.columns(2)
 
@@ -2018,10 +1780,10 @@ def render_ai_settings(user, settings):
             else:
                 st.error(cloud_error(data))
 
-        if right.button("🚪 Выйти из CyberAI Cloud", width="stretch"):
-            cloud_call("/api/logout", token=token)
-            cloud_forget(user["id"])
-            st.rerun()
+        right.caption(
+            "Лимит: 30 сообщений за 10 минут и 300 в сутки. "
+            "Без ограничений — со своим ключом Groq."
+        )
 
         st.caption(
             "Сообщения идут через сервер CyberAI Cloud, который "
@@ -3733,126 +3495,73 @@ def render_capture_settings(user, settings):
 # НАСТРОЙКИ ПОЧТЫ
 # ============================================================
 
-def render_email_settings(user):
-    st.markdown("#### 📧 Почта аккаунта")
+def render_account_settings(user):
+    st.markdown(f"**Логин:** {user['username']}")
+    st.markdown(f"**Почта:** {user.get('email') or '—'}")
+    st.markdown(f"**Последний вход на этом компьютере:** "
+                f"{user.get('last_login') or 'первый вход'}")
+    st.caption(
+        "Аккаунт хранится на сервере CyberAI Cloud — с ним можно войти "
+        "на любом компьютере. История мониторинга и настройки хранятся "
+        "на каждом компьютере отдельно."
+    )
 
-    if mailer.is_demo():
-        st.info(
-            "🧪 Сейчас **демо-режим почты**: коды не отправляются в "
-            "письмах, а печатаются в терминале, где запущен streamlit. "
-            "Для учебного проекта этого достаточно."
-        )
+    token = ss.get("cloud_token")
 
-        with st.expander("📖 Как включить настоящие письма (Gmail)"):
-            st.markdown(
-                "1. Заведи или возьми Gmail, с которого программа будет "
-                "отправлять коды (лучше отдельный, например "
-                "`cyberai.lab.codes@gmail.com`).\n"
-                "2. Включи в нём **двухэтапную аутентификацию**: "
-                "Google-аккаунт → Безопасность.\n"
-                "3. Открой **myaccount.google.com/apppasswords**, введи "
-                "название `CyberAI Lab` и нажми **Создать**. Google покажет "
-                "пароль из 16 букв — скопируй его.\n"
-                "4. Открой в папке проекта файл **.streamlit/secrets.toml** "
-                "(он уже создан) и заполни:\n"
-                "```toml\n"
-                "[email]\n"
-                'smtp_server = "smtp.gmail.com"\n'
-                "smtp_port = 465\n"
-                'user = "cyberai.lab.codes@gmail.com"\n'
-                'password = "abcd efgh ijkl mnop"\n'
-                'sender_name = "CyberAI Lab"\n'
-                "```\n"
-                "5. Сохрани файл и обнови страницу.\n\n"
-                "Для Mail.ru: `smtp.mail.ru`, для Яндекса: `smtp.yandex.ru` "
-                "(порт тоже 465, тоже нужен пароль приложения)."
-            )
+    st.divider()
+    st.markdown("#### 🔒 Смена пароля")
 
-            st.link_button(
-                "🌐 Открыть страницу паролей приложений Google",
-                "https://myaccount.google.com/apppasswords",
-            )
+    with st.form("change_password_form", clear_on_submit=True):
+        old = st.text_input("Текущий пароль", type="password")
+        new = st.text_input("Новый пароль", type="password")
+        new2 = st.text_input("Повтори новый пароль", type="password")
+        submitted = st.form_submit_button("Изменить пароль")
 
-    if not user.get("email"):
-        st.warning(
-            "К аккаунту не привязана почта — если забудешь пароль, "
-            "восстановить его будет нельзя. Привяжи почту ниже."
-        )
-
-    key = client_key()
-    pending = ss.get("email_change")
-
-    if pending:
-        st.markdown(
-            f"📨 Код отправлен на **{database.mask_email(pending)}**."
-        )
-        demo_hint("change")
-
-        with st.form("email_change_code_form"):
-            code = st.text_input(
-                "Код из письма",
-                max_chars=database.CODE_LENGTH,
-            )
-            confirm = st.form_submit_button("✅ Подтвердить почту")
-
-        if confirm:
-            ok, error = database.verify_email_code(pending, "change", code)
-
-            if not ok:
-                st.error(error)
-            else:
-                ok, message = database.set_user_email(user["id"], pending)
-
-                if ok:
-                    ss.user["email"] = pending
-                    ss.pop("email_change", None)
-                    ss.email_flash = message
-                    st.rerun()
-                else:
-                    st.error(message)
-
-        if st.button("Отмена", key="email_change_cancel"):
-            ss.pop("email_change", None)
-            st.rerun()
-
-        return
-
-    flash = ss.pop("email_flash", None)
-    if flash:
-        st.success(flash)
-
-    with st.form("email_change_form", clear_on_submit=True):
-        value = st.text_input(
-            "Новая почта" if user.get("email") else "Почта",
-            placeholder="name@gmail.com",
-        )
-        send = st.form_submit_button(
-            "📨 Отправить код подтверждения"
-        )
-
-    if send:
-        value = database.normalize_email(value)
-        error = database.validate_email(value)
-
-        if not error and value == database.normalize_email(user.get("email")):
-            error = "Эта почта уже привязана к твоему аккаунту."
-
-        if not error and database.email_exists(value):
-            error = "Эта почта уже привязана к другому аккаунту."
-
-        if not error:
-            error = send_code_to(value, "change", key)
-
-        if error:
-            st.error(error)
+    if submitted:
+        if not token:
+            render_relogin_hint()
+        elif new != new2:
+            st.error("Новые пароли не совпадают.")
         else:
-            ss.email_change = value
-            st.rerun()
+            status, data = cloud_call(
+                "/api/password",
+                {"old_password": old, "new_password": new},
+                token=token,
+            )
 
+            if status == 200:
+                database.delete_user_sessions(
+                    user["id"], keep_token=ss.get("session_token")
+                )
+                st.success(
+                    "Пароль изменён. На других устройствах нужно войти заново."
+                )
+            elif status == 401:
+                render_relogin_hint()
+            else:
+                st.error(cloud_error(data))
 
-# ============================================================
-# PAGE: НАСТРОЙКИ
-# ============================================================
+    st.divider()
+    st.markdown("#### 💻 Устройства")
+    st.caption("Если входил с чужого компьютера — нажми кнопку ниже.")
+
+    if st.button("🚪 Выйти на всех других устройствах"):
+        if token:
+            status, data = cloud_call("/api/logout-others", token=token)
+        else:
+            status, data = 401, {}
+
+        database.delete_user_sessions(
+            user["id"], keep_token=ss.get("session_token")
+        )
+
+        if status == 200:
+            st.success("Готово: на других устройствах нужно войти заново.")
+        elif status == 401:
+            render_relogin_hint()
+        else:
+            st.error(cloud_error(data))
+
 
 def page_settings(user):
     st.subheader("⚙️ Настройки")
@@ -3877,51 +3586,7 @@ def page_settings(user):
 
     # ---------------- Аккаунт ----------------
     with tab_account:
-        st.markdown(f"**Логин:** {user['username']}")
-        st.markdown(f"**Почта:** {user.get('email') or 'не привязана'}")
-        st.markdown(f"**Аккаунт создан:** {user.get('created_at') or '—'}")
-        st.markdown(f"**Предыдущий вход:** {user.get('last_login') or 'первый вход'}")
-
-        st.divider()
-        render_email_settings(user)
-
-        st.divider()
-        st.markdown("#### 🔒 Смена пароля")
-
-        with st.form("change_password_form", clear_on_submit=True):
-            old = st.text_input("Текущий пароль", type="password")
-            new = st.text_input("Новый пароль", type="password")
-            new2 = st.text_input("Повтори новый пароль", type="password")
-            submitted = st.form_submit_button("Изменить пароль")
-
-        if submitted:
-            ok, message = database.change_password(
-                user["id"], old, new, new2
-            )
-
-            if ok:
-                # Новый пароль — выкидываем все остальные устройства.
-                database.delete_user_sessions(
-                    user["id"], keep_token=ss.get("session_token")
-                )
-                st.success(message + " Другие устройства вышли из аккаунта.")
-            else:
-                st.error(message)
-
-        st.divider()
-        st.markdown("#### 💻 Устройства")
-
-        sessions = database.count_sessions(user["id"])
-        st.caption(
-            f"Запомненных входов (браузеров): {sessions}. "
-            "Если входил с чужого компьютера — нажми кнопку ниже."
-        )
-
-        if st.button("🚪 Выйти на всех других устройствах"):
-            database.delete_user_sessions(
-                user["id"], keep_token=ss.get("session_token")
-            )
-            st.success("Готово: на других устройствах нужно войти заново.")
+        render_account_settings(user)
 
 
 # ============================================================

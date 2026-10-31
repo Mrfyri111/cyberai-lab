@@ -316,18 +316,69 @@ def register_user(username, password, password2, email=None):
     return True, "Аккаунт создан! Теперь войди под своим логином."
 
 
-def create_guest_user():
-    """Временный аккаунт для знакомства с программой без регистрации."""
-    for _ in range(10):
-        username = "guest-" + secrets.token_hex(3)
-        password = secrets.token_urlsafe(24)
-        ok, _ = register_user(username, password, password)
+def ensure_local_user(username, email=""):
+    """Аккаунты живут на сервере CyberAI Cloud. Здесь — локальная
+    «копия» пользователя, к которой привязаны его история, настройки
+    и обученная модель на этом компьютере. Пароль локально не нужен."""
+    username = username.strip()
+    email = normalize_email(email) or None
 
-        if ok:
-            user, _ = authenticate(username, password)
-            return user
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT * FROM users WHERE username = ?",
+            (username,),
+        ).fetchone()
 
-    return None
+        if row is None:
+            salt = secrets.token_hex(16)
+            cursor = conn.execute(
+                "INSERT INTO users (username, password_hash, salt, "
+                "created_at, email) VALUES (?, ?, ?, ?, ?)",
+                (
+                    username,
+                    _hash_password(secrets.token_urlsafe(32), salt),
+                    salt,
+                    _now(),
+                    None,
+                ),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO user_settings (user_id) VALUES (?)",
+                (cursor.lastrowid,),
+            )
+            user_id = cursor.lastrowid
+            created_at = _now()
+            last_login = None
+        else:
+            user_id = row["id"]
+            created_at = row["created_at"]
+            last_login = row["last_login"]
+
+        # Почта с сервера — главная; у других локальных записей её снимаем,
+        # чтобы не мешал уникальный индекс.
+        if email:
+            conn.execute(
+                "UPDATE users SET email = NULL WHERE email = ? COLLATE NOCASE "
+                "AND id != ?",
+                (email, user_id),
+            )
+            conn.execute(
+                "UPDATE users SET email = ? WHERE id = ?",
+                (email, user_id),
+            )
+
+        conn.execute(
+            "UPDATE users SET last_login = ? WHERE id = ?",
+            (_now(), user_id),
+        )
+
+    return {
+        "id": user_id,
+        "username": username,
+        "email": email,
+        "created_at": created_at,
+        "last_login": last_login,
+    }
 
 
 def authenticate(username, password):
