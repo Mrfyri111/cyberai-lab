@@ -213,7 +213,7 @@ async function sendMail(env, to, code, purpose) {
 
   const connect = env.__connect || (await import("cloudflare:sockets")).connect;
   const socket = connect(
-    { hostname: env.SMTP_HOST || "smtp.gmail.com", port: Number(env.SMTP_PORT || 465) },
+    { hostname: "smtp.gmail.com", port: 465 },
     { secureTransport: "on", allowHalfOpen: false },
   );
 
