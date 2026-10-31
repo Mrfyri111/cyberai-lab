@@ -183,23 +183,42 @@ const MAIL_TEXT = {
 
 function buildMail(from, to, code, purpose) {
   const [title, text] = MAIL_TEXT[purpose] || MAIL_TEXT.register;
-  const body =
+  const plain =
     `${title}\r\n\r\n${text}\r\n\r\n    ${code}\r\n\r\n` +
     `Код действует ${CODE_MINUTES} минут. Никому его не сообщай.\r\n` +
     "Если ты ничего не запрашивал — просто проигнорируй это письмо.\r\n\r\n" +
     "— CyberAI Lab";
+  const html =
+    '<div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;color:#1f2937">' +
+    `<h2 style="color:#2563eb;margin:0 0 12px">CyberAI Lab</h2>` +
+    `<p style="margin:0 0 8px"><b>${title}</b></p>` +
+    `<p style="margin:0 0 16px">${text}</p>` +
+    `<p style="font-size:30px;letter-spacing:6px;font-weight:bold;margin:0 0 16px">${code}</p>` +
+    `<p style="color:#6b7280;font-size:13px;margin:0">Код действует ${CODE_MINUTES} минут. ` +
+    "Никому его не сообщай. Если ты ничего не запрашивал — просто проигнорируй это письмо.</p>" +
+    "</div>";
+  const boundary = "cyberai-" + randomHex(8);
 
+  // Message-ID не задаём — Gmail поставит свой (чужой домен там — признак спама).
   return [
     `From: =?UTF-8?B?${base64("CyberAI Lab")}?= <${from}>`,
     `To: <${to}>`,
-    `Subject: =?UTF-8?B?${base64(`${code} — ${title} | CyberAI Lab`)}?=`,
+    `Subject: =?UTF-8?B?${base64(`Код CyberAI Lab: ${code}`)}?=`,
     `Date: ${new Date().toUTCString()}`,
-    `Message-ID: <${randomHex(12)}@cyberai.lab>`,
     "MIME-Version: 1.0",
+    `Content-Type: multipart/alternative; boundary="${boundary}"`,
+    "",
+    `--${boundary}`,
     "Content-Type: text/plain; charset=UTF-8",
     "Content-Transfer-Encoding: base64",
     "",
-    wrap76(base64(body)),
+    wrap76(base64(plain)),
+    `--${boundary}`,
+    "Content-Type: text/html; charset=UTF-8",
+    "Content-Transfer-Encoding: base64",
+    "",
+    wrap76(base64(html)),
+    `--${boundary}--`,
   ].join("\r\n");
 }
 
@@ -248,7 +267,7 @@ async function sendMail(env, to, code, purpose) {
 
   try {
     await reply(220);
-    await send("EHLO cyberai.lab", 250);
+    await send("EHLO localhost", 250);
     await send("AUTH LOGIN", 334);
     await send(base64(user), 334);
     try {
