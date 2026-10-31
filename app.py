@@ -1734,7 +1734,7 @@ SHARED_AI_LIMIT = 15  # сообщений за 10 минут на общем к
 # Ключ Groq хранится только на сервере, в программу он не попадает.
 # Код сервера: proxy/groq-worker.js
 # ------------------------------------------------------------
-CLOUD_URL = ""
+CLOUD_URL = "https://cyberai-cloud.mexenstg.workers.dev"
 
 AI_CLOUD = "🌐 Общий ИИ CyberAI"
 AI_OWN = "🔑 Свой ключ Groq"
