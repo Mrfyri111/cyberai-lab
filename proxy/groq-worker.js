@@ -13,15 +13,8 @@
 // Привязки (Worker → Settings → Bindings):
 //   DB             — D1 database (cyberai)
 //   GROQ_API_KEY   — Secrets Store: ключ gsk_...
-//   SMTP_USER      — Secrets Store: адрес почты, с которой идут письма
-//                    (Gmail, Mail.ru или Яндекс — сервер выберется сам)
-//   SMTP_PASSWORD  — Secrets Store: пароль приложения этой почты
-// Или вместо Gmail — сервис рассылки Brevo (без пароля приложения):
-//   BREVO_API_KEY  — Secrets Store: ключ xkeysib-... из Brevo
-//   MAIL_FROM      — Secrets Store: почта отправителя, подтверждённая в Brevo
-// Пока почты нет — тестовый режим (письма не отправляются, коды видны
-// только владельцу в Cloudflare → Worker → Logs → Live):
-//   MAIL_TEST      — Secrets Store или переменная: 1
+//   SMTP_USER      — Secrets Store: адрес Gmail, с которого идут письма
+//   SMTP_PASSWORD  — Secrets Store: пароль приложения Gmail (16 букв)
 // Таблицы создаются сами.
 //
 // Заблокировать пользователя: D1 → cyberai → Console:
@@ -210,56 +203,7 @@ function buildMail(from, to, code, purpose) {
   ].join("\r\n");
 }
 
-async function mailText(code, purpose) {
-  const [title, text] = MAIL_TEXT[purpose] || MAIL_TEXT.register;
-  return {
-    subject: `${code} — ${title} | CyberAI Lab`,
-    body:
-      `${title}\n\n${text}\n\n    ${code}\n\n` +
-      `Код действует ${CODE_MINUTES} минут. Никому его не сообщай.\n` +
-      "Если ты ничего не запрашивал — просто проигнорируй это письмо.\n\n" +
-      "— CyberAI Lab",
-  };
-}
-
-// Brevo: письмо через HTTP API (бесплатно до 300 писем в день).
-async function sendBrevo(env, key, to, code, purpose) {
-  const from = await secret(env, "MAIL_FROM");
-  if (!from) throw new Error("на сервере не задан MAIL_FROM (почта отправителя)");
-  const { subject, body } = await mailText(code, purpose);
-  const response = await fetch("https://api.brevo.com/v3/smtp/email", {
-    method: "POST",
-    headers: { "api-key": key, "Content-Type": "application/json", Accept: "application/json" },
-    body: JSON.stringify({
-      sender: { name: "CyberAI Lab", email: from },
-      to: [{ email: to }],
-      subject,
-      textContent: body,
-    }),
-  });
-  if (!response.ok) {
-    const text = (await response.text()).slice(0, 200);
-    throw new Error(`Brevo не отправил письмо (${response.status}): ${text}`);
-  }
-}
-
-// Почтовый сервер по адресу отправителя (у всех — SSL, порт 465).
-function smtpHost(user) {
-  const domain = user.split("@").pop().toLowerCase();
-  if (["mail.ru", "bk.ru", "inbox.ru", "list.ru", "internet.ru"].includes(domain)) return "smtp.mail.ru";
-  if (["yandex.ru", "ya.ru", "yandex.com", "yandex.by", "yandex.kz"].includes(domain)) return "smtp.yandex.ru";
-  return "smtp.gmail.com";
-}
-
 async function sendMail(env, to, code, purpose) {
-  if ((await secret(env, "MAIL_TEST")) === "1") {
-    console.log(`[ТЕСТ ПОЧТЫ] код ${code} для ${to} (${purpose})`);
-    return;
-  }
-
-  const brevoKey = await secret(env, "BREVO_API_KEY");
-  if (brevoKey) return sendBrevo(env, brevoKey, to, code, purpose);
-
   const user = await secret(env, "SMTP_USER");
   const password = (await secret(env, "SMTP_PASSWORD")).replace(/\s+/g, "");
 
@@ -269,7 +213,7 @@ async function sendMail(env, to, code, purpose) {
 
   const connect = env.__connect || (await import("cloudflare:sockets")).connect;
   const socket = connect(
-    { hostname: (await secret(env, "SMTP_HOST")) || smtpHost(user), port: 465 },
+    { hostname: env.SMTP_HOST || "smtp.gmail.com", port: Number(env.SMTP_PORT || 465) },
     { secureTransport: "on", allowHalfOpen: false },
   );
 
@@ -826,21 +770,12 @@ export default {
       const missing = [];
       if (!env.DB) missing.push("привязка D1 с именем DB");
       if (!(await secret(env, "GROQ_API_KEY"))) missing.push("секрет GROQ_API_KEY");
-      const mailTest = (await secret(env, "MAIL_TEST")) === "1";
-      if (mailTest) {
-        // письма не нужны — коды пишутся в логи
-      } else if (await secret(env, "BREVO_API_KEY")) {
-        if (!(await secret(env, "MAIL_FROM"))) missing.push("секрет MAIL_FROM");
-      } else {
-        if (!(await secret(env, "SMTP_USER"))) missing.push("секрет SMTP_USER (или BREVO_API_KEY)");
-        if (!(await secret(env, "SMTP_PASSWORD"))) missing.push("секрет SMTP_PASSWORD (или BREVO_API_KEY)");
-      }
+      if (!(await secret(env, "SMTP_USER"))) missing.push("секрет SMTP_USER");
+      if (!(await secret(env, "SMTP_PASSWORD"))) missing.push("секрет SMTP_PASSWORD");
       return new Response(
         missing.length
           ? "CyberAI Cloud: не настроено — нужны: " + missing.join(", ")
-          : mailTest
-            ? "CyberAI Cloud: OK (тестовый режим почты: коды в Logs)"
-            : "CyberAI Cloud: OK",
+          : "CyberAI Cloud: OK",
         { headers: { "Content-Type": "text/plain; charset=utf-8" } },
       );
     }
