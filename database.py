@@ -50,6 +50,9 @@ _SETTING_COLUMNS = {
     "groq_key": "groq_key_enc",
     "tshark_path": "tshark_path",
     "interface": "interface",
+    "ai_mode": "ai_mode",
+    "cloud_token": "cloud_token_enc",
+    "cloud_user": "cloud_user",
 }
 
 _DUMMY_SALT = secrets.token_hex(16)
@@ -143,6 +146,18 @@ def init_db():
 
         if "email" not in columns:
             conn.execute("ALTER TABLE users ADD COLUMN email TEXT")
+
+        # ---- Выбор ИИ и вход в CyberAI Cloud ----
+        setting_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(user_settings)")
+        }
+
+        for column in ("ai_mode", "cloud_token_enc", "cloud_user"):
+            if column not in setting_columns:
+                conn.execute(
+                    f"ALTER TABLE user_settings ADD COLUMN {column} TEXT"
+                )
 
         conn.executescript(
             """
@@ -796,23 +811,33 @@ def get_settings(user_id):
             (user_id,),
         ).fetchone()
 
+    empty = {
+        "groq_key": "", "tshark_path": "", "interface": "",
+        "ai_mode": "", "cloud_token": "", "cloud_user": "",
+    }
+
     if row is None:
-        return {"groq_key": "", "tshark_path": "", "interface": ""}
+        return empty
 
-    groq_key = ""
-
-    if row["groq_key_enc"]:
+    def decrypt(value):
+        if not value:
+            return ""
         try:
-            groq_key = _get_fernet().decrypt(
-                row["groq_key_enc"].encode()
-            ).decode()
+            return _get_fernet().decrypt(value.encode()).decode()
         except (InvalidToken, ValueError):
-            groq_key = ""
+            return ""
+
+    keys = row.keys()
 
     return {
-        "groq_key": groq_key,
+        "groq_key": decrypt(row["groq_key_enc"]),
         "tshark_path": row["tshark_path"] or "",
         "interface": row["interface"] or "",
+        "ai_mode": (row["ai_mode"] if "ai_mode" in keys else "") or "",
+        "cloud_token": decrypt(
+            row["cloud_token_enc"] if "cloud_token_enc" in keys else ""
+        ),
+        "cloud_user": (row["cloud_user"] if "cloud_user" in keys else "") or "",
     }
 
 
@@ -831,7 +856,7 @@ def save_settings(user_id, **values):
 
             value = (value or "").strip()
 
-            if name == "groq_key" and value:
+            if name in ("groq_key", "cloud_token") and value:
                 value = _get_fernet().encrypt(value.encode()).decode()
 
             conn.execute(

@@ -714,6 +714,9 @@ def login(user, token=None):
     ss.user = user
     ss.session_token = token
     ss.groq_key = settings["groq_key"]
+    ss.cloud_token = settings["cloud_token"]
+    ss.cloud_user = settings["cloud_user"]
+    ss.ai_choice = settings["ai_mode"]
     ss.chat_history = []
     ss.page = PAGES[0]
     ss.last_page = PAGES[0]
@@ -758,6 +761,8 @@ def logout():
         "user", "groq_key", "chat_history", "pdf_bytes",
         "pdf_source", "interfaces", "engine_msg", "session_token",
         "email_change", "reset_email", "reg_pending",
+        "cloud_token", "cloud_user", "ai_choice", "ai_choice_widget",
+        "ai_ai_pick", "settings_ai_pick",
         "demo_code_register", "demo_code_change", "capture_source",
     ]:
         ss.pop(key, None)
@@ -1562,9 +1567,9 @@ def make_client(key):
     )
 
 
-def make_proxy_client(url):
+def make_cloud_client(url, token):
     return OpenAI(
-        api_key="cyberai-proxy",
+        api_key=token,
         base_url=url.rstrip("/") + "/v1",
         default_headers={"X-CyberAI-App": "1"},
         timeout=60,
@@ -1724,31 +1729,95 @@ def server_groq_key():
 
 SHARED_AI_LIMIT = 15  # сообщений за 10 минут на общем ключе
 
-# Посредник (Cloudflare Worker) с ключом владельца — для тех, у кого
-# нет своего ключа. Сам ключ в программу не попадает.
-# Код посредника: proxy/groq-worker.js
-DEFAULT_AI_PROXY_URL = ""
+# ------------------------------------------------------------
+# CyberAI Cloud — сервер аккаунтов и общего ИИ (Cloudflare Worker).
+# Ключ Groq хранится только на сервере, в программу он не попадает.
+# Код сервера: proxy/groq-worker.js
+# ------------------------------------------------------------
+CLOUD_URL = ""
+
+AI_CLOUD = "🌐 Общий ИИ CyberAI"
+AI_OWN = "🔑 Свой ключ Groq"
 
 
-def ai_proxy_url():
+def cloud_url():
+    for section in ("cloud", "ai_proxy"):
+        try:
+            url = str((st.secrets.get(section) or {}).get("url") or "").strip()
+        except Exception:
+            url = ""
+        if url:
+            return url
+
+    return os.environ.get("CYBERAI_CLOUD", "").strip() or CLOUD_URL
+
+
+def cloud_call(path, payload=None, token=None, method="POST"):
+    """Запрос к CyberAI Cloud. Возвращает (код, ответ)."""
+    import urllib.error
+    import urllib.request
+
+    data = json.dumps(payload or {}).encode("utf-8") if method == "POST" else None
+    request = urllib.request.Request(
+        cloud_url().rstrip("/") + path,
+        data=data,
+        method=method,
+        headers={
+            "Content-Type": "application/json",
+            "X-CyberAI-App": "1",
+            "User-Agent": f"CyberAI-Lab/{VERSION}",
+        },
+    )
+
+    if token:
+        request.add_header("Authorization", f"Bearer {token}")
+
     try:
-        section = st.secrets.get("ai_proxy") or {}
-        url = str(section.get("url") or "").strip()
-    except Exception:
-        url = ""
+        with urllib.request.urlopen(request, timeout=20) as response:
+            return response.status, json.loads(response.read() or b"{}")
+    except urllib.error.HTTPError as error:
+        try:
+            body = json.loads(error.read() or b"{}")
+        except ValueError:
+            body = {}
+        return error.code, body
+    except Exception as error:
+        return 0, {"error": {"message": f"Нет связи с CyberAI Cloud: {error}"}}
 
-    return url or os.environ.get("CYBERAI_AI_PROXY", "").strip() \
-        or DEFAULT_AI_PROXY_URL
+
+def cloud_error(data):
+    return (data.get("error") or {}).get("message") or "Ошибка CyberAI Cloud."
+
+
+def cloud_forget(user_id):
+    ss.cloud_token = ""
+    database.save_settings(user_id, cloud_token="")
+
+
+def ai_choice():
+    """Что выбрал пользователь: cloud — общий ИИ, own — свой ключ."""
+    choice = ss.get("ai_choice")
+
+    if choice in ("cloud", "own"):
+        return choice
+
+    if (ss.get("groq_key") or "").strip() or not cloud_url():
+        return "own"
+
+    return "cloud"
 
 
 def ai_mode():
-    """own — свой ключ; server — общий ключ сайта; proxy — посредник."""
-    if (ss.get("groq_key") or "").strip():
+    """cloud — общий ИИ через CyberAI Cloud; own — свой ключ;
+    server — общий ключ сайта (Secrets на Streamlit Cloud)."""
+    own = (ss.get("groq_key") or "").strip()
+
+    if ai_choice() == "cloud" and cloud_url() and ss.get("cloud_token"):
+        return "cloud"
+    if own:
         return "own"
     if server_groq_key():
         return "server"
-    if ai_proxy_url():
-        return "proxy"
     return ""
 
 
@@ -1764,24 +1833,222 @@ def ask_ai(question, data, force_network=False):
     mode = ai_mode()
 
     if not mode:
-        raise ValueError("Подключи Groq API Key в ⚙️ Настройках.")
+        raise ValueError("Подключи ИИ в ⚙️ Настройках → 🤖 ИИ-помощник.")
 
     detailed = ss.get("answer_style") == "Подробно"
 
     client = (
-        make_proxy_client(ai_proxy_url()) if mode == "proxy"
+        make_cloud_client(cloud_url(), ss.cloud_token) if mode == "cloud"
         else make_client(active_groq_key())
     )
 
-    response = client.chat.completions.create(
-        model=GROQ_MODEL,
-        messages=build_messages(question, data, force_network),
-        temperature=0.4,
-        max_completion_tokens=4096 if detailed else 1500,
-        reasoning_effort="low",
-    )
+    try:
+        response = client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=build_messages(question, data, force_network),
+            temperature=0.4,
+            max_completion_tokens=4096 if detailed else 1500,
+            reasoning_effort="low",
+        )
+    except openai.AuthenticationError:
+        if mode == "cloud" and current_user():
+            cloud_forget(current_user()["id"])
+            raise ValueError(
+                "Вход в CyberAI Cloud истёк — войди заново "
+                "(⚙️ Настройки → 🤖 ИИ-помощник)."
+            )
+        raise
 
     return clean_answer(response.choices[0].message.content or "")
+
+
+def save_cloud_login(user, data):
+    ss.cloud_token = data["token"]
+    ss.cloud_user = data.get("username", "")
+    ss.ai_choice = "cloud"
+    database.save_settings(
+        user["id"],
+        cloud_token=data["token"],
+        cloud_user=ss.cloud_user,
+        ai_mode="cloud",
+    )
+
+
+def render_cloud_login(prefix, user):
+    st.markdown(
+        "**Общий ИИ CyberAI** — бесплатно, свой ключ не нужен. Нужен "
+        "аккаунт **CyberAI Cloud** (он хранится на сервере, отдельно "
+        "от входа в программу). Лимит: 30 сообщений за 10 минут "
+        "и 300 в сутки."
+    )
+
+    tab_in, tab_up = st.tabs(["Вход", "Регистрация"])
+
+    with tab_in:
+        with st.form(f"{prefix}_cloud_login"):
+            name = st.text_input("Логин CyberAI Cloud", value=user["username"])
+            password = st.text_input("Пароль", type="password")
+            sent = st.form_submit_button(
+                "Войти", type="primary", width="stretch"
+            )
+
+        if sent:
+            with st.spinner("Вхожу в CyberAI Cloud..."):
+                status, data = cloud_call(
+                    "/api/login", {"username": name, "password": password}
+                )
+
+            if status == 200 and data.get("token"):
+                save_cloud_login(user, data)
+                ss.groq_flash = "Готово! Общий ИИ подключён. 🎉"
+                st.rerun()
+            else:
+                st.error(cloud_error(data))
+
+    with tab_up:
+        with st.form(f"{prefix}_cloud_register"):
+            name = st.text_input(
+                "Придумай логин",
+                value=user["username"] if not user["username"].startswith("guest-") else "",
+                help="3–32 символа: латинские буквы, цифры, _ . -",
+            )
+            password = st.text_input(
+                "Придумай пароль", type="password",
+                help="Минимум 8 символов, буквы и цифры.",
+            )
+            password2 = st.text_input("Повтори пароль", type="password")
+            sent = st.form_submit_button(
+                "Создать аккаунт", type="primary", width="stretch"
+            )
+
+        if sent:
+            if password != password2:
+                st.error("Пароли не совпадают.")
+            else:
+                with st.spinner("Создаю аккаунт в CyberAI Cloud..."):
+                    status, data = cloud_call(
+                        "/api/register",
+                        {"username": name, "password": password},
+                    )
+
+                if status == 200 and data.get("token"):
+                    save_cloud_login(user, data)
+                    ss.groq_flash = "Аккаунт создан, общий ИИ подключён. 🎉"
+                    st.rerun()
+                else:
+                    st.error(cloud_error(data))
+
+
+def on_ai_choice_change(user_id):
+    value = ss.get("ai_choice_widget")
+
+    if value is None:
+        ss.ai_choice_widget = AI_CLOUD if ai_choice() == "cloud" else AI_OWN
+        return
+
+    ss.ai_choice = "cloud" if value == AI_CLOUD else "own"
+    database.save_settings(user_id, ai_mode=ss.ai_choice)
+
+
+def render_ai_setup(prefix, user):
+    """Выбор: общий ИИ (аккаунт CyberAI Cloud) или свой ключ Groq."""
+    if not cloud_url():
+        render_groq_setup(prefix, user)
+        return
+
+    key = f"{prefix}_ai_pick"
+
+    if ss.get(key) not in (AI_CLOUD, AI_OWN):
+        ss[key] = AI_CLOUD if ai_choice() == "cloud" else AI_OWN
+
+    st.segmented_control(
+        "Как подключить ИИ",
+        options=[AI_CLOUD, AI_OWN],
+        key=key,
+        selection_mode="single",
+        width="stretch",
+    )
+
+    if (ss.get(key) or AI_CLOUD) == AI_CLOUD:
+        render_cloud_login(prefix, user)
+    else:
+        render_groq_setup(prefix, user)
+
+
+def render_ai_settings(user, settings):
+    if cloud_url():
+        if ss.get("ai_choice_widget") not in (AI_CLOUD, AI_OWN):
+            ss.ai_choice_widget = AI_CLOUD if ai_choice() == "cloud" else AI_OWN
+
+        st.segmented_control(
+            "Какой ИИ использовать",
+            options=[AI_CLOUD, AI_OWN],
+            key="ai_choice_widget",
+            on_change=on_ai_choice_change,
+            args=(user["id"],),
+            selection_mode="single",
+            width="stretch",
+        )
+
+    use_cloud = cloud_url() and ai_choice() == "cloud"
+
+    if use_cloud:
+        token = ss.get("cloud_token")
+
+        if not token:
+            render_cloud_login("settings", user)
+            return
+
+        st.success(f"Вошёл в CyberAI Cloud как **{ss.get('cloud_user') or '—'}**")
+
+        left, right = st.columns(2)
+
+        if left.button("📊 Сколько сообщений осталось", width="stretch"):
+            status, data = cloud_call("/api/me", token=token, method="GET")
+
+            if status == 200:
+                st.info(
+                    f"За 10 минут: {data['used_10_min']} из "
+                    f"{data['limit_10_min']} • за сутки: {data['used_day']} "
+                    f"из {data['limit_day']}"
+                )
+            elif status == 401:
+                cloud_forget(user["id"])
+                st.warning("Вход истёк — войди заново.")
+            else:
+                st.error(cloud_error(data))
+
+        if right.button("🚪 Выйти из CyberAI Cloud", width="stretch"):
+            cloud_call("/api/logout", token=token)
+            cloud_forget(user["id"])
+            st.rerun()
+
+        st.caption(
+            "Сообщения идут через сервер CyberAI Cloud, который "
+            "добавляет ключ Groq. Сервер ничего не сохраняет, кроме "
+            "счётчика сообщений для лимита."
+        )
+        return
+
+    key = ss.get("groq_key") or ""
+
+    if key:
+        st.success(f"Ключ подключён: `{key[:4]}…{key[-4:]}`")
+
+        if settings["groq_key"]:
+            st.caption("Ключ сохранён в аккаунте в зашифрованном виде.")
+        else:
+            st.caption("Ключ действует только до выхода из аккаунта.")
+
+        if st.button("❌ Удалить ключ"):
+            ss.groq_key = ""
+            database.save_settings(user["id"], groq_key="")
+            st.rerun()
+
+        with st.expander("🔁 Заменить ключ"):
+            render_groq_setup("replace", user)
+    else:
+        render_groq_setup("settings", user)
 
 
 def scroll_to_last_answer():
@@ -2531,7 +2798,10 @@ def render_sidebar(user):
 
         if ss.get("groq_key"):
             st.success("Ключ подключён")
-        elif ai_mode() in ("server", "proxy"):
+        elif ai_mode() == "cloud":
+            st.success("Общий ИИ CyberAI")
+            st.caption(f"Аккаунт CyberAI Cloud: {ss.get('cloud_user') or '—'}")
+        elif ai_mode() == "server":
             st.success("AI работает через общий ключ")
             st.caption("Можно подключить свой — в ⚙️ Настройках.")
         else:
@@ -3117,7 +3387,12 @@ def page_ai(user):
         st.subheader("🤖 CyberAI Assistant")
         if ai_mode() == "own":
             st.caption(f"Модель {GROQ_MODEL} через Groq • твой ключ")
-        elif ai_mode() in ("server", "proxy"):
+        elif ai_mode() == "cloud":
+            st.caption(
+                f"Модель {GROQ_MODEL} • общий ИИ CyberAI • "
+                f"аккаунт {ss.get('cloud_user') or '—'}"
+            )
+        elif ai_mode() == "server":
             st.caption(
                 f"Модель {GROQ_MODEL} через Groq • общий ключ "
                 f"(до {SHARED_AI_LIMIT} сообщений за 10 мин)"
@@ -3136,12 +3411,11 @@ def page_ai(user):
 
     if not ai_available():
         st.info(
-            "Чтобы начать беседу, подключи бесплатный ключ Groq — "
-            "это займёт 1–2 минуты."
+            "Чтобы начать беседу, подключи ИИ — это займёт 1–2 минуты."
         )
 
         with st.container(border=True):
-            render_groq_setup("ai", user)
+            render_ai_setup("ai", user)
 
         return
 
@@ -3201,7 +3475,7 @@ def page_ai(user):
 
     # Общий ключ сервера: ограничиваем, чтобы один человек
     # не израсходовал весь лимит Groq.
-    if ai_mode() in ("server", "proxy"):
+    if ai_mode() == "server":
         limit_key = f"ai:{user['id']}"
 
         if len(recent_events(limit_key)) >= SHARED_AI_LIMIT:
@@ -3588,32 +3862,14 @@ def page_settings(user):
         st.success(flash)
 
     tab_ai, tab_capture, tab_account = st.tabs(
-        ["🤖 Groq AI", "📡 Захват трафика", "👤 Аккаунт"]
+        ["🤖 ИИ-помощник", "📡 Захват трафика", "👤 Аккаунт"]
     )
 
     settings = database.get_settings(user["id"])
 
-    # ---------------- Groq ----------------
+    # ---------------- ИИ ----------------
     with tab_ai:
-        key = ss.get("groq_key") or ""
-
-        if key:
-            st.success(f"Ключ подключён: `{key[:4]}…{key[-4:]}`")
-
-            if settings["groq_key"]:
-                st.caption("Ключ сохранён в аккаунте в зашифрованном виде.")
-            else:
-                st.caption("Ключ действует только до выхода из аккаунта.")
-
-            if st.button("❌ Удалить ключ"):
-                ss.groq_key = ""
-                database.save_settings(user["id"], groq_key="")
-                st.rerun()
-
-            with st.expander("🔁 Заменить ключ"):
-                render_groq_setup("replace", user)
-        else:
-            render_groq_setup("settings", user)
+        render_ai_settings(user, settings)
 
     # ---------------- Захват ----------------
     with tab_capture:
