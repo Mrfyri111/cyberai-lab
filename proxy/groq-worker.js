@@ -204,7 +204,7 @@ function buildMail(from, to, code, purpose) {
 }
 
 async function sendMail(env, to, code, purpose) {
-  const user = await secret(env, "SMTP_USER");
+  const user = (await secret(env, "SMTP_USER")).trim();
   const password = (await secret(env, "SMTP_PASSWORD")).replace(/\s+/g, "");
 
   if (!user || !password) {
@@ -253,8 +253,13 @@ async function sendMail(env, to, code, purpose) {
     await send(base64(user), 334);
     try {
       await send(base64(password), 235);
-    } catch {
-      throw new Error("почта не приняла логин или пароль приложения");
+    } catch (error) {
+      // Короткая подсказка + ответ Gmail (без пароля) — чтобы понять причину.
+      const answer = String(error.message).replace("почтовый сервер: ", "").slice(0, 120);
+      throw new Error(
+        `Gmail не принял вход для ${maskEmail(user)} ` +
+        `(пароль приложения: ${password.length} символов; ответ Gmail: ${answer})`,
+      );
     }
     await send(`MAIL FROM:<${user}>`, 250);
     await send(`RCPT TO:<${to}>`, 250);
