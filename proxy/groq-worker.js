@@ -13,8 +13,9 @@
 // Привязки (Worker → Settings → Bindings):
 //   DB             — D1 database (cyberai)
 //   GROQ_API_KEY   — Secrets Store: ключ gsk_...
-//   SMTP_USER      — Secrets Store: адрес Gmail, с которого идут письма
-//   SMTP_PASSWORD  — Secrets Store: пароль приложения Gmail (16 букв)
+//   SMTP_USER      — Secrets Store: адрес почты, с которой идут письма
+//                    (Gmail, Mail.ru или Яндекс — сервер выберется сам)
+//   SMTP_PASSWORD  — Secrets Store: пароль приложения этой почты
 // Или вместо Gmail — сервис рассылки Brevo (без пароля приложения):
 //   BREVO_API_KEY  — Secrets Store: ключ xkeysib-... из Brevo
 //   MAIL_FROM      — Secrets Store: почта отправителя, подтверждённая в Brevo
@@ -242,6 +243,14 @@ async function sendBrevo(env, key, to, code, purpose) {
   }
 }
 
+// Почтовый сервер по адресу отправителя (у всех — SSL, порт 465).
+function smtpHost(user) {
+  const domain = user.split("@").pop().toLowerCase();
+  if (["mail.ru", "bk.ru", "inbox.ru", "list.ru", "internet.ru"].includes(domain)) return "smtp.mail.ru";
+  if (["yandex.ru", "ya.ru", "yandex.com", "yandex.by", "yandex.kz"].includes(domain)) return "smtp.yandex.ru";
+  return "smtp.gmail.com";
+}
+
 async function sendMail(env, to, code, purpose) {
   if ((await secret(env, "MAIL_TEST")) === "1") {
     console.log(`[ТЕСТ ПОЧТЫ] код ${code} для ${to} (${purpose})`);
@@ -260,7 +269,7 @@ async function sendMail(env, to, code, purpose) {
 
   const connect = env.__connect || (await import("cloudflare:sockets")).connect;
   const socket = connect(
-    { hostname: env.SMTP_HOST || "smtp.gmail.com", port: Number(env.SMTP_PORT || 465) },
+    { hostname: (await secret(env, "SMTP_HOST")) || smtpHost(user), port: 465 },
     { secureTransport: "on", allowHalfOpen: false },
   );
 
