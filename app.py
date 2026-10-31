@@ -3495,6 +3495,87 @@ def render_capture_settings(user, settings):
 # НАСТРОЙКИ ПОЧТЫ
 # ============================================================
 
+def render_forgot_current_password(user):
+    """Смена пароля по коду с почты — если текущий пароль забыт."""
+    email = user.get("email") or ""
+
+    flash = ss.pop("acc_reset_flash", None)
+    if flash:
+        st.success(flash)
+
+    if not ss.get("acc_reset_sent"):
+        if st.button("🤔 Забыл текущий пароль? Сменить по коду с почты"):
+            if not email:
+                st.error("К аккаунту не привязана почта — выйди и войди заново.")
+                return
+
+            with st.spinner("Отправляю письмо..."):
+                status, data = cloud_call("/api/reset/start", {"email": email})
+
+            if status == 200:
+                ss.acc_reset_sent = True
+                st.rerun()
+            else:
+                st.error(cloud_error(data))
+        return
+
+    with st.container(border=True):
+        st.markdown(
+            f"📨 Код отправлен на **{database.mask_email(email)}**. "
+            "Проверь и папку «Спам»."
+        )
+
+        with st.form("acc_reset_form", clear_on_submit=True):
+            code = st.text_input("Код из письма", max_chars=6, placeholder="123456")
+            new = st.text_input("Новый пароль", type="password")
+            new2 = st.text_input("Повтори новый пароль", type="password")
+            submit = st.form_submit_button("🔒 Сменить пароль", type="primary")
+
+        if submit:
+            if new != new2:
+                st.error("Пароли не совпадают.")
+                return
+
+            with st.spinner("Меняю пароль..."):
+                status, data = cloud_call(
+                    "/api/reset/confirm",
+                    {"email": email, "code": code, "password": new},
+                )
+
+            if status != 200:
+                st.error(cloud_error(data))
+                return
+
+            # Сброс пароля выходит со всех устройств — сразу входим заново,
+            # чтобы на этом компьютере ничего не слетело.
+            status, data = cloud_call(
+                "/api/login", {"login": email, "password": new}
+            )
+            ss.acc_reset_sent = False
+            database.delete_user_sessions(
+                user["id"], keep_token=ss.get("session_token")
+            )
+
+            if status == 200:
+                database.save_settings(
+                    user["id"],
+                    cloud_token=data["token"],
+                    cloud_user=data["username"],
+                )
+                ss.cloud_token = data["token"]
+                ss.acc_reset_flash = (
+                    "Пароль изменён. На других устройствах нужно войти заново."
+                )
+            else:
+                ss.acc_reset_flash = "Пароль изменён. Войди заново с новым паролем."
+
+            st.rerun()
+
+        if st.button("Отмена", key="acc_reset_cancel"):
+            ss.acc_reset_sent = False
+            st.rerun()
+
+
 def render_account_settings(user):
     st.markdown(f"**Логин:** {user['username']}")
     st.markdown(f"**Почта:** {user.get('email') or '—'}")
@@ -3540,6 +3621,8 @@ def render_account_settings(user):
                 render_relogin_hint()
             else:
                 st.error(cloud_error(data))
+
+    render_forgot_current_password(user)
 
     st.divider()
     st.markdown("#### 💻 Устройства")
